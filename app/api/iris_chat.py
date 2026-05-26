@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 import json
 
@@ -16,8 +16,7 @@ class IrisChatRequest(BaseModel):
     session_id: Optional[str] = None
     conversation_id: Optional[str] = None
     
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 @router.post("/chat")
 async def chat_endpoint(req: IrisChatRequest, api_key: str = Depends(get_api_key)):

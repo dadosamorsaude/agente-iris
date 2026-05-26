@@ -10,6 +10,7 @@ check_eval.py
 final_test.py
 iris.json
 *.html
+*
 *.json
 
 # Python-generated files

@@ -8,7 +8,7 @@ os critérios estritos de qualidade do Judge do N8N (judge.json).
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from langchain_openai import ChatOpenAI
 
@@ -199,7 +199,7 @@ def _empty_evaluation(reason: str) -> dict:
         "block_reason": "judge_parse_error",
         "issues": [{"tipo": "judge_parse_error", "severidade": "alto", "message": reason}],
         "justificativa": reason,
-        "evaluated_at": datetime.utcnow().isoformat(),
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "model": settings.MODEL_NAME,
     }
 
