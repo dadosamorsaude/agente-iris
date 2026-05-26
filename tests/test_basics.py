@@ -8,7 +8,7 @@ def test_read_main():
     response = client.get("/")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["agent"] == "IRIS"
+    assert response.json()["agent"] == "Iris"
 
 def test_api_key_protected():
     """Verifica se o chat está protegido por API Key."""
