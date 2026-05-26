@@ -6,6 +6,9 @@ chunking-normas.py
 chunking-regras.py
 chunking-rdc.py
 chunking-catarata.py
+check_eval.py
+final_test.py
+iris.json
 *.html
 
 # Python-generated files
@@ -28,3 +31,6 @@ wheels/
 # Temporary and Data folders
 scratch/
 rag/
+
+# Tests
+tests/
