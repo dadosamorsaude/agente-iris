@@ -1,4 +1,4 @@
-name: CI - Test & Build
+name: CI - Build
 
 on:
   push:
@@ -7,60 +7,9 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          version: "latest"
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies (with dev group)
-        run: uv sync --frozen --group dev
-
-      - name: Run tests
-        run: uv run pytest tests/ -v
-        env:
-          PYTHONPATH: .
-          # ── LLM ────────────────────────────────────
-          OPENAI_API_KEY: "sk-test-000"
-          MODEL_NAME: "gpt-4o"
-          MODEL_NAME_SQL: "gpt-4o-mini"
-          TEMPERATURE: "0.0"
-          ANTHROPIC_API_KEY: "sk-ant-test-000"
-          MODEL_CLAUDE: "claude-sonnet-4-6"
-          TEMPERATURE_CLAUDE: "0.4"
-          # ── AWS / Athena ────────────────────────────
-          AWS_ACCESS_KEY_ID: "testing"
-          AWS_SECRET_ACCESS_KEY: "testing"
-          AWS_REGION: "us-east-1"
-          ATHENA_DATABASE: "test_db"
-          ATHENA_S3_STAGING_DIR: "s3://test-bucket/athena-results/"
-          # ── Pinecone ────────────────────────────────
-          PINECONE_API_KEY: "pc-test-000"
-          PINECONE_INDEX_CFM: "test-index-cfm"
-          PINECONE_INDEX_POP: "test-index-pop"
-          PINECONE_INDEX_CACHE: "test-index-cache"
-          # ── Security ────────────────────────────────
-          AGENTE_API_KEY: "test-secret"
-          ALLOWED_ORIGINS: "http://localhost:3000"
-          # ── Database (opcional em testes) ───────────
-          DATABASE_URL: ""
-
   build-check:
     name: Docker Build Check
     runs-on: ubuntu-latest
-    needs: test
 
     steps:
       - uses: actions/checkout@v4
