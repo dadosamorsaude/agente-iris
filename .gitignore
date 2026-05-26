@@ -1,0 +1,30 @@
+# Environments
+.env
+.env.*
+criar_index_pinecone.py
+chunking-normas.py
+chunking-regras.py
+chunking-rdc.py
+chunking-catarata.py
+*.html
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.pdm-python
+.python-version
+
+# IDEs
+.vscode/
+.idea/
+
+# Temporary and Data folders
+scratch/
+rag/

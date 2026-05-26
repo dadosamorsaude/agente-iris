@@ -1,0 +1,38 @@
+# Environments and Secrets
+.env
+.env.*
+secrets.json
+
+# Python
+__pycache__/
+*.py[oc]
+.pytest_cache
+.coverage
+.tox
+.nox
+
+# Virtual Environments
+.venv
+venv/
+ENV/
+
+# Data and Logs
+rag/
+scratch/
+*.log
+
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+
+# IDEs
+.vscode/
+.idea/
+
+# Scripts
+chunking-*.py
+criar_index_pinecone.py

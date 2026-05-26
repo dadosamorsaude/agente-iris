@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: projeto-iris
+    runtime: docker
+    plan: free # Change to a higher plan if needed
+    region: ohio # Change to your preferred region
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: OPENAI_API_KEY
+        sync: false # Set in Render Dashboard
+      - key: MODEL_NAME
+        value: gpt-4o
+      - key: TEMPERATURE
+        value: 0.0
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: us-east-1
+      - key: ATHENA_DATABASE
+        sync: false
+      - key: ATHENA_S3_STAGING_DIR
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_CFM
+        value: qualidade-conformidade-2
+      - key: PINECONE_INDEX_POP
+        value: pops-nr-2
+      - key: DATABASE_URL
+        sync: false
+      - key: LANGCHAIN_TRACING_V2
+        value: "true"
+      - key: LANGCHAIN_API_KEY
+        sync: false
+      - key: LANGCHAIN_PROJECT
+        value: projeto-iris
+      - key: AGENTE_API_KEY
+        sync: false # Set your secret key in Render Dashboard

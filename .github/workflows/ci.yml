@@ -1,0 +1,57 @@
+name: CI - Test & Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Run tests
+        run: |
+          uv run pytest
+        env:
+          PYTHONPATH: .
+          # Mock environment variables for tests
+          OPENAI_API_KEY: "sk-test-123"
+          ANTHROPIC_API_KEY: "sk-ant-test-123"
+          AGENTE_API_KEY: "test-secret"
+          ALLOWED_ORIGINS: "*"
+          AWS_REGION: "us-east-1"
+          AWS_ACCESS_KEY_ID: "testing"
+          AWS_SECRET_ACCESS_KEY: "testing"
+          ATHENA_DATABASE: "test_db"
+          ATHENA_S3_STAGING_DIR: "s3://test-bucket/"
+          PINECONE_API_KEY: "pc-test-123"
+          PINECONE_INDEX_CFM: "test-index"
+          PINECONE_INDEX_POP: "test-index"
+          PINECONE_INDEX_CACHE: "test-index"
+
+  build-check:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build . -t ai-agent-test

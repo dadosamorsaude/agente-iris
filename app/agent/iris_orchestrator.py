@@ -1,0 +1,444 @@
+"""
+Iris Orchestrator — Deep Agent Principal
+
+Orquestrador do novo sistema Iris. Coordena os agentes especialistas e
+implementa o fluxo de raciocínio profundo (Multi-Agent Deep Architecture):
+  1. Pre-Router & Intent Analyzer
+  2. Loader de Aprendizados Curados
+  3. Clinical RAG Expert Agent
+  4. SQL Query Analyst & Executor Agent
+  5. Iris Synthesizer (LLM)
+  6. Quality Judge & Critic Agent (Loop de Retry Síncrono)
+  7. Self-Learning & Persistent Logger
+"""
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import date
+from typing import AsyncGenerator, Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from app.core.config import settings
+from app.services.intent import detect_intent
+from app.services.learning import load_curated_lessons, generate_lessons_from_execution, save_learned_lessons
+from app.services.evaluation_store import save_execution_log
+from app.agent.evaluator import evaluate_response
+from app.agent.specialists.clinical_rag import clinical_rag_expert
+from app.agent.specialists.sql_analyst import sql_analyst_expert
+from app.services.memory import get_session_history
+from app.tools.athena import athena_results_context
+from app.tools.rag import rag_results_context
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt do Iris Synthesizer
+# ─────────────────────────────────────────────────────────────────────────────
+
+IRIS_SYNTHESIZER_SYSTEM = """Você é a Iris, agente orquestrador principal do sistema de auditoria de cirurgias de catarata.
+
+Você receberá:
+- A pergunta original do usuário
+- O contexto clínico (rag_context) com as regras da régua de catarata
+- Os dados quantitativos do banco de dados (sql_result)
+- Aprendizados preventivos do projeto (memory_context) como checklist operacional
+- Metadados de intenção (output_mode, sample_mode, wants_rows)
+
+## Uso dos Aprendizados do Projeto
+Os aprendizados são um checklist preventivo. Use-os para evitar erros recorrentes já identificados.
+Eles NÃO substituem o RAG. Eles NÃO substituem o SQL. Eles NÃO autorizam inventar dados.
+Em conflito: dados reais do SQL vencem. Régua clínica do RAG vence. Aprendizados servem apenas como orientação de processo.
+Não copie o texto dos aprendizados na resposta ao usuário.
+
+## Regras de Resposta
+1. Saudação simples: responda diretamente sem invocar dados: "Olá, eu sou a Iris, em que posso te ajudar?"
+2. Perguntas substantivas sobre catarata: use o rag_context como régua clínica e os dados do sql_result.
+3. Nunca invente dados, totais, percentuais, pacientes, atendimentos, scores ou evidências.
+4. Nunca exponha a arquitetura interna, nomes de agentes, steps técnicos ou SQL bruto ao usuário (exceto se explicitamente solicitado).
+5. Se sql_result tiver erro ou estiver vazio: informe que não foi possível consultar os dados.
+6. Se output_mode="sample" ou sample_mode=true: retorne registros individuais sem resumo agregado.
+7. Para relatório/contagem: inclua total, estratificação e percentuais quando disponíveis.
+8. Se houver score, explique de forma simples os fatores que contribuíram.
+
+## Formato de Saída OBRIGATÓRIO (JSON puro, sem markdown)
+{
+  "final_answer": "<resposta completa em texto para o usuário>",
+  "analysis_type": "<contagem|listagem|distribuicao|amostra|relatorio|comparacao|classificacao_direta|conceitual|saudacao|erro>",
+  "periodo": {"inicio": null, "fim_exclusivo": null},
+  "unit_of_analysis": "<id_atendimento|id_paciente|nao_aplicavel>",
+  "error": false,
+  "errorType": null,
+  "errorMessage": null,
+  "rag_used": false,
+  "sql_used": false,
+  "user_asked_for_sql": false
+}"""
+
+IRIS_RETRY_SYSTEM = """Você é a Iris. Você está em MODO RETRY PÓS-JUDGE para corrigir sua resposta anterior.
+
+Use a crítica do Judge como checklist de correção.
+Use APENAS os dados já disponíveis em sql_result, rag_context e retry_context.
+Não invente novos dados. Não exponha o Judge ou a arquitetura interna.
+Se os dados disponíveis forem insuficientes para corrigir, informe isso claramente.
+Preserve o formato JSON obrigatório."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_llm(temperature: float = 0.0) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=settings.MODEL_NAME,
+        temperature=temperature,
+        api_key=settings.OPENAI_API_KEY,
+    )
+
+
+def _safe_json(text: str) -> dict | None:
+    """Tenta extrair JSON de uma string, removendo blocos de código markdown."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.rsplit("```", 1)[0]
+    try:
+        return json.loads(text.strip())
+    except Exception:
+        return None
+
+
+def _truncate(text: Any, max_chars: int = 2500) -> str:
+    t = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    return t[:max_chars] + "..." if len(t) > max_chars else t
+
+
+def _build_synthesizer_prompt(
+    user_question: str,
+    intent: dict,
+    rag_context: str,
+    sql_result: dict,
+    memory_context: str,
+    is_retry: bool = False,
+    retry_context: str = "",
+    hoje: str = "",
+) -> str:
+    """Monta o prompt completo do usuário para o Iris Synthesizer."""
+    parts = [
+        f"Pergunta: {user_question}",
+        f"\nData de hoje: {hoje}",
+        f"\nOutput mode: {intent.get('output_mode', 'summary')}",
+        f"Sample mode: {intent.get('sample_mode', False)}",
+        f"Wants rows: {intent.get('wants_rows', False)}",
+    ]
+
+    if memory_context:
+        parts.append(f"\nAprendizados do projeto (checklist preventivo):\n{_truncate(memory_context, 2000)}")
+
+    if rag_context:
+        parts.append(f"\nContexto Clínico RAG (régua de catarata):\n{_truncate(rag_context, 2500)}")
+
+    if sql_result:
+        exec_status = sql_result.get("execution_status", "unknown")
+        if exec_status == "error":
+            parts.append(f"\nResultado SQL: ERRO — {sql_result.get('error', {}).get('message', 'erro desconhecido')}")
+        else:
+            parts.append(f"\nResultado SQL:\n{_truncate(sql_result, 3000)}")
+
+    if is_retry and retry_context:
+        parts.append(f"\nMODO RETRY — Crítica do Judge:\n{retry_context}")
+        parts.append("\nInstrução: Corrija a resposta anterior usando apenas os dados acima. Não invente dados.")
+
+    return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iris Synthesizer (chamada ao LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _iris_synthesize(
+    user_question: str,
+    intent: dict,
+    rag_context: str,
+    sql_result: dict,
+    memory_context: str,
+    history_messages: list,
+    is_retry: bool = False,
+    retry_context: str = "",
+    hoje: str = "",
+) -> dict:
+    """Invoca o LLM sintetizador e parseia o JSON de saída."""
+    system = IRIS_RETRY_SYSTEM if is_retry else IRIS_SYNTHESIZER_SYSTEM
+    user_content = _build_synthesizer_prompt(
+        user_question, intent, rag_context, sql_result,
+        memory_context, is_retry, retry_context, hoje
+    )
+
+    messages = [SystemMessage(content=system)] + history_messages + [HumanMessage(content=user_content)]
+
+    llm = _get_llm()
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(None, llm.invoke, messages)
+
+    raw = response.content.strip() if hasattr(response, "content") else str(response)
+    parsed = _safe_json(raw)
+
+    if not parsed:
+        # Fallback: retorna texto bruto como final_answer
+        logger.warning("Iris Synthesizer: resposta não é JSON válido, usando texto bruto.")
+        return {
+            "final_answer": raw,
+            "analysis_type": "nao_aplicavel",
+            "periodo": {"inicio": None, "fim_exclusivo": None},
+            "unit_of_analysis": "nao_aplicavel",
+            "error": False,
+            "errorType": None,
+            "errorMessage": None,
+            "rag_used": bool(rag_context),
+            "sql_used": bool(sql_result and sql_result.get("execution_status") != "error"),
+            "user_asked_for_sql": False,
+        }
+
+    return parsed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iris Run Agent — Ponto de entrada principal
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def run_iris_agent(
+    user_id: str,
+    message: str,
+    stream: bool = False,
+    session_id: str | None = None,
+    conversation_id: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Ponto de entrada principal do sistema Iris Deep Agent.
+    Orquestra todos os especialistas e retorna a resposta final.
+    - Se stream=True, emite chunks de texto à medida que o LLM responde.
+    - Se stream=False, emite a resposta final única.
+    """
+    logger.info(f"Iris Deep Agent iniciado | user_id={user_id} | stream={stream}")
+
+    if not message or not message.strip():
+        yield "Por favor, digite uma mensagem."
+        return
+
+    job_id = str(uuid.uuid4())
+    hoje = date.today().isoformat()
+    effective_session = session_id or user_id
+    effective_conversation = conversation_id or user_id
+
+    # Zera os contextos de captura para esta execução
+    athena_results_context.set([])
+    rag_results_context.set([])
+
+    # ── 1. Pre-Router & Intent Analyzer ──────────────────────────────────────
+    intent = detect_intent(message)
+    logger.info(f"Intent detectado: {intent}")
+
+    # ── 2. Loader de Aprendizados Curados ────────────────────────────────────
+    memory_context = load_curated_lessons()
+
+    # ── 3. Histórico de sessão ───────────────────────────────────────────────
+    history = get_session_history(effective_session)
+    recent_messages = list(history.messages)[-8:]
+
+    # ── 4. Saudação simples — resposta rápida sem especialistas ─────────────
+    if intent.get("is_simple"):
+        greeting = "Olá, eu sou a Iris, em que posso te ajudar?"
+        history.add_user_message(message)
+        history.add_ai_message(greeting)
+        simple_result = {
+            "final_answer": greeting,
+            "analysis_type": "saudacao",
+            "periodo": {"inicio": None, "fim_exclusivo": None},
+            "unit_of_analysis": "nao_aplicavel",
+            "error": False, "errorType": None, "errorMessage": None,
+            "rag_used": False, "sql_used": False, "user_asked_for_sql": False,
+            "judge_passed": True, "judge_score": 1.0,
+            "job_id": job_id, "sessionId": effective_session, "conversationId": effective_conversation,
+            "originalInput": message, "validated": True, "has_data": False,
+        }
+        asyncio.create_task(_post_execution(job_id, effective_session, effective_conversation, message, simple_result, [], []))
+        yield greeting
+        return
+
+    # ── 5. Clinical RAG Expert Agent ─────────────────────────────────────────
+    rag_context = ""
+    loop = asyncio.get_event_loop()
+    try:
+        rag_context = await loop.run_in_executor(None, clinical_rag_expert, message)
+        logger.info("RAG Expert concluído.")
+    except Exception as e:
+        logger.error(f"RAG Expert falhou: {e}")
+
+    rag_used = bool(rag_context)
+
+    # ── 6. SQL Query Analyst & Executor Agent ─────────────────────────────────
+    sql_result = {}
+    sql_used = False
+    try:
+        sql_result = await loop.run_in_executor(
+            None,
+            sql_analyst_expert,
+            message,
+            rag_context,
+            intent.get("output_mode", "summary"),
+            intent.get("sample_size") or 5,
+            hoje,
+            0
+        )
+        sql_used = sql_result.get("execution_status") != "error"
+        logger.info(f"SQL Analyst concluído | status={sql_result.get('execution_status')} | row_count={sql_result.get('row_count', 0)}")
+    except Exception as e:
+        logger.error(f"SQL Analyst falhou: {e}")
+        sql_result = {"execution_status": "error", "error": {"message": str(e)}, "rows": [], "summary": {}, "row_count": 0}
+
+    # ── 7. Iris Synthesizer ──────────────────────────────────────────────────
+    try:
+        synth_result = await _iris_synthesize(
+            message, intent, rag_context, sql_result,
+            memory_context, recent_messages, hoje=hoje
+        )
+    except Exception as e:
+        logger.exception("Iris Synthesizer falhou")
+        synth_result = {
+            "final_answer": "Não foi possível gerar uma resposta no momento. Tente novamente.",
+            "analysis_type": "erro", "error": True,
+            "errorType": "synthesizer_error", "errorMessage": str(e),
+            "rag_used": rag_used, "sql_used": sql_used, "user_asked_for_sql": False,
+        }
+
+    synth_result["rag_used"] = rag_used
+    synth_result["sql_used"] = sql_used
+
+    # ── 8. Quality Judge & Retry Síncrono (apenas em stream=False) ───────────
+    if not stream and not synth_result.get("error") and (rag_used or sql_used):
+        raw_athena = athena_results_context.get([])
+        raw_rag = rag_results_context.get([])
+
+        try:
+            evaluation = await evaluate_response(
+                user_question=message,
+                agent_response=synth_result.get("final_answer", ""),
+                raw_athena_data=raw_athena,
+                rag_context=raw_rag,
+            )
+
+            judge_passed = evaluation.get("aprovado", False)
+            judge_score = evaluation.get("score", 0) / 100.0  # normaliza para 0-1
+            synth_result["judge_passed"] = judge_passed
+            synth_result["judge_score"] = judge_score
+            synth_result["judge_output"] = evaluation
+
+            logger.info(f"Judge concluído | aprovado={judge_passed} | score={judge_score}")
+
+            # Retry se reprovado
+            if not judge_passed and judge_score < 0.75:
+                logger.info("Judge reprovou. Iniciando Retry da Iris...")
+                judge_critique = {
+                    "judge_passed": judge_passed,
+                    "judge_score": judge_score,
+                    "issues": evaluation.get("erros_encontrados", []),
+                    "feedback": evaluation.get("justificativa", ""),
+                }
+                retry_context_str = json.dumps({
+                    "tipo": "retry_pos_judge",
+                    "instrucao": "Corrija a resposta anterior com base na crítica do Judge.",
+                    "critica_do_judge": judge_critique,
+                    "resposta_anterior": synth_result.get("final_answer", ""),
+                    "query_result": sql_result,
+                    "rag_context": rag_context[:1000],
+                }, ensure_ascii=False)[:2500]
+
+                try:
+                    retry_result = await _iris_synthesize(
+                        message, intent, rag_context, sql_result,
+                        memory_context, recent_messages,
+                        is_retry=True, retry_context=retry_context_str, hoje=hoje
+                    )
+                    retry_result["rag_used"] = rag_used
+                    retry_result["sql_used"] = sql_used
+                    retry_result["judge_passed"] = judge_passed
+                    retry_result["judge_score"] = judge_score
+                    retry_result["judge_output"] = evaluation
+                    retry_result["retry_applied"] = True
+                    retry_result["retry_count"] = 1
+                    synth_result = retry_result
+                    logger.info("Retry da Iris concluído.")
+                except Exception as retry_err:
+                    logger.error(f"Retry falhou: {retry_err}")
+        except Exception as judge_err:
+            logger.error(f"Judge falhou: {judge_err}")
+            synth_result.setdefault("judge_passed", None)
+            synth_result.setdefault("judge_score", None)
+
+    # ── 9. Monta o resultado final completo ───────────────────────────────────
+    final_answer = synth_result.get("final_answer", "Não foi possível gerar uma resposta.")
+    synth_result.update({
+        "job_id": job_id,
+        "sessionId": effective_session,
+        "conversationId": effective_conversation,
+        "originalInput": message,
+        "validated": not synth_result.get("error", False),
+        "has_data": sql_used and (sql_result.get("row_count", 0) > 0),
+        "executor_row_count": sql_result.get("row_count", 0),
+        "executor_summary": sql_result.get("summary", {}),
+        "query_result": sql_result if sql_used else None,
+    })
+
+    # Persiste histórico
+    history.add_user_message(message)
+    history.add_ai_message(final_answer)
+
+    # ── 10. Post-Execution em background (auto-learning + logging) ────────────
+    raw_athena = athena_results_context.get([])
+    raw_rag = rag_results_context.get([])
+    asyncio.create_task(_post_execution(
+        job_id, effective_session, effective_conversation,
+        message, synth_result, raw_athena, raw_rag
+    ))
+
+    yield final_answer
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-Execution: Auto-Learning + Logging (background)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _post_execution(
+    job_id: str,
+    session_id: str,
+    conversation_id: str,
+    original_input: str,
+    result: dict,
+    raw_athena: list,
+    raw_rag: list,
+) -> None:
+    """Executa as tarefas de logging e auto-learning em background."""
+    try:
+        # Auto-Learning: gera e salva lições
+        lessons = generate_lessons_from_execution(result)
+        if lessons:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, save_learned_lessons, lessons)
+            logger.info(f"Auto-Learning: {len(lessons)} lição(ões) salva(s).")
+
+        # Logging de execução
+        await save_execution_log(
+            job_id=job_id,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            original_input=original_input,
+            result=result
+        )
+    except Exception as e:
+        logger.error(f"Erro no post-execution da Iris: {e}")
