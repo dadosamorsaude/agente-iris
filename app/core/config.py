@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 

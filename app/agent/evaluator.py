@@ -164,10 +164,13 @@ async def evaluate_response(
 
         evaluation = {
             "judge_passed": judge_passed,
+            "aprovado": judge_passed,
             "overall_score": score,
+            "score": score * 100.0,
             "should_block_callback": should_block,
             "block_reason": parsed.get("block_reason") if should_block else None,
             "issues": parsed.get("issues", []),
+            "erros_encontrados": parsed.get("issues", []),
             "justificativa": parsed.get("justificativa", "Avaliação de auditoria clínica concluída."),
             "evaluated_at": datetime.utcnow().isoformat(),
             "model": settings.MODEL_NAME,

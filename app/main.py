@@ -12,7 +12,7 @@ import os
 from dotenv import load_dotenv
 
 # Carrega arquivos .env pro os.environ (essencial pro LangSmith enxergar as chaves no ambiente)
-load_dotenv()
+load_dotenv(override=True)
 
 app = FastAPI(
     title="Iris AI Agent",

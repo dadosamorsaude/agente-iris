@@ -36,6 +36,16 @@ from app.tools.rag import rag_results_context
 logger = logging.getLogger(__name__)
 
 
+def _run_clinical_rag_in_thread(query: str):
+    res = clinical_rag_expert(query)
+    return res, rag_results_context.get([])
+
+
+def _run_sql_analyst_in_thread(query, rag_context, output_mode, sample_size, hoje, retry_count):
+    res = sql_analyst_expert(query, rag_context, output_mode, sample_size, hoje, retry_count)
+    return res, athena_results_context.get([])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt do Iris Synthesizer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,7 +285,8 @@ async def run_iris_agent(
     rag_context = ""
     loop = asyncio.get_event_loop()
     try:
-        rag_context = await loop.run_in_executor(None, clinical_rag_expert, message)
+        rag_context, captured_rag = await loop.run_in_executor(None, _run_clinical_rag_in_thread, message)
+        rag_results_context.set(captured_rag)
         logger.info("RAG Expert concluído.")
     except Exception as e:
         logger.error(f"RAG Expert falhou: {e}")
@@ -286,9 +297,9 @@ async def run_iris_agent(
     sql_result = {}
     sql_used = False
     try:
-        sql_result = await loop.run_in_executor(
+        sql_result, captured_athena = await loop.run_in_executor(
             None,
-            sql_analyst_expert,
+            _run_sql_analyst_in_thread,
             message,
             rag_context,
             intent.get("output_mode", "summary"),
@@ -296,6 +307,7 @@ async def run_iris_agent(
             hoje,
             0
         )
+        athena_results_context.set(captured_athena)
         sql_used = sql_result.get("execution_status") != "error"
         logger.info(f"SQL Analyst concluído | status={sql_result.get('execution_status')} | row_count={sql_result.get('row_count', 0)}")
     except Exception as e:
@@ -333,8 +345,11 @@ async def run_iris_agent(
                 rag_context=raw_rag,
             )
 
-            judge_passed = evaluation.get("aprovado", False)
-            judge_score = evaluation.get("score", 0) / 100.0  # normaliza para 0-1
+            judge_passed = evaluation.get("judge_passed", evaluation.get("aprovado", False))
+            judge_score = evaluation.get("overall_score", evaluation.get("score", 0) / 100.0)
+            if judge_score > 1.0:
+                judge_score = judge_score / 100.0
+                
             synth_result["judge_passed"] = judge_passed
             synth_result["judge_score"] = judge_score
             synth_result["judge_output"] = evaluation
@@ -347,7 +362,7 @@ async def run_iris_agent(
                 judge_critique = {
                     "judge_passed": judge_passed,
                     "judge_score": judge_score,
-                    "issues": evaluation.get("erros_encontrados", []),
+                    "issues": evaluation.get("issues", evaluation.get("erros_encontrados", [])),
                     "feedback": evaluation.get("justificativa", ""),
                 }
                 retry_context_str = json.dumps({
