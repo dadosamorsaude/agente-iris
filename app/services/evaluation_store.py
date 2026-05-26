@@ -82,7 +82,8 @@ async def save_execution_log(
     result: dict
 ) -> None:
     """
-    Salva o log de execução clínica estruturado da Iris na tabela memoria_execucoes_iris.
+    Salva o log de execução clínica estruturado da Iris na tabela de auditoria judge_evaluations (Supabase).
+    Garante fidelidade total com os campos configurados no logging.json.
     """
     if not settings.supabase_rest_url or not settings.DATABASE_API_KEY:
         logger.warning("Supabase não configurado. Ignorando gravação de log de execução.")
@@ -90,39 +91,55 @@ async def save_execution_log(
 
     try:
         final_answer = result.get("final_answer", result.get("output", ""))
+        
+        # Limita caracteres nos campos textuais grandes conforme o Preparar Log do n8n
+        def clip(v, max_chars):
+            if v is None: return None
+            s = str(v)
+            return s[:max_chars] + "..." if len(s) > max_chars else s
+
         meta_payload = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "workflow_stage": result.get("workflow_stage"),
             "unit_of_analysis": result.get("unit_of_analysis"),
             "periodo": result.get("periodo"),
             "validated": result.get("validated", False),
             "has_data": result.get("has_data", False),
             "orchestration": result.get("orchestration", {}),
-            "issues": result.get("issues", [])
         }
 
+        # Payload mapeado 100% conforme a estrutura de colunas do N8N (logging.json)
         payload = {
-            "job_id": job_id,
+            "workflow_id": "projeto-iris-backend",
+            "execution_id": job_id,
             "session_id": session_id,
             "conversation_id": conversation_id,
-            "original_input": original_input,
-            "final_answer": final_answer,
+            "original_input": clip(original_input, 3000),
+            "candidate_answer": clip(final_answer, 4000),
+            "final_output": clip(final_answer, 4000),
             "analysis_type": result.get("analysis_type", ""),
             "rag_used": result.get("rag_used", False),
             "sql_used": result.get("sql_used", False),
             "row_count": result.get("executor_row_count", 0),
-            "judge_passed": result.get("judge_passed"),
-            "judge_score": result.get("judge_score"),
+            "judge_passed": result.get("judge_passed", False),
+            "judge_score": float(result.get("judge_score") or 0.0),
+            "block_reason": result.get("errorType") if result.get("error") else None,
+            "issues": result.get("issues") or [],
             "error": result.get("error", False),
             "error_type": result.get("errorType"),
-            "error_message": result.get("errorMessage"),
-            "metadata": meta_payload
+            "metadata": meta_payload,
+            "retry_count": result.get("retry_count", 0),
+            "max_retries": 1,
+            "score_final": float(result.get("judge_score") or 0.0) * 100.0,  # converte de volta para escala 0-100 para o Metabase
         }
 
-        url = f"{settings.supabase_rest_url}memoria_execucoes_iris"
+        url = f"{settings.supabase_rest_url}judge_evaluations"
         resp = httpx.post(url, headers=_get_headers(), json=payload, timeout=10.0)
         resp.raise_for_status()
-        logger.info(f"Log de execução da Iris salvo com sucesso via REST | job_id={job_id}")
+        logger.info(f"Log de execução da Iris salvo com sucesso via REST na tabela 'judge_evaluations' | job_id={job_id}")
     except Exception as e:
-        logger.error(f"Erro ao salvar log de execução via REST: {e}")
+        logger.error(f"Erro ao salvar log de execução via REST em 'judge_evaluations': {e}")
+
 
 
 async def get_evaluation_summary() -> dict:

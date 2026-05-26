@@ -9,58 +9,262 @@ registros individuais conforme o output_mode solicitado.
 
 import json
 import logging
+import re
+from datetime import datetime, timedelta, date
 from app.tools.athena import _execute_athena_query, validate_sql, athena_results_context
 from app.services.llm import get_chat_model_openai
 
 logger = logging.getLogger(__name__)
 
-# Schema da tabela de catarata
+# Schema oficial da tabela de catarata do N8N
 CATARATA_SCHEMA = """
-Tabela principal: pdgt_amorsaude_inteligencia.tb_qualidade_prontuarios
+Tabela principal: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
+Dialeto: Athena/Presto SQL
 
 Colunas disponíveis:
-- id_agendamento, id_atendimento, data_atendimento
-- status_agendamento, id_procedimento, id_especialidade, especialidade
-- anamnese, conduta, hipotese_diagnostica, observacao, orientacao, solicitacao
-- especialidade_destino, cid_codigo, cid_codigo_txt (alias disponível), cid_descricao_detalhada
-- id_clinica, clinica, regional, uf
-- id_profissional, nome_profissional, prontuario_assinado
+- id_paciente: bigint
+- nome_paciente: string
+- id_atendimento: bigint
+- data_atendimento: date
+- id_especialidade: bigint (Sempre filtrar por id_especialidade = 661)
+- especialidade: string
+- anamnese: string
+- conduta: string
+- hipotese_diagnostica: string
+- observacao: string
+- orientacao: string
+- solicitacao: string
+- especialidade_destino: string
+- cid_codigo: string
+- cid_descricao_detalhada: string
+- id_clinica: bigint
+- clinica: string
+- regional: string
+- uf: string
+- municipio: string
+- id_profissional: bigint
+- nome_profissional: string
+- prontuario_assinado: int
+- id_exame_solicitado: bigint
+- exame_solicitado: string
+- prescricao: string
+- posologia: string
+- obs_atend_oftalmo: string
+- flg_prescricao_cirurgica: string
+- atestado: string
+
+Campos narrativos/textuais para busca clínica (narrative_fields):
+- anamnese, conduta, hipotese_diagnostica, observacao, orientacao, solicitacao, exame_solicitado, prescricao, posologia, obs_atend_oftalmo, atestado, cid_descricao_detalhada
 
 Filtros obrigatórios SEMPRE:
-1. status_agendamento IN (4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 24, 40, 60, 83)
-2. id_especialidade NOT IN (932, 1154, 993, 776, 777, 892, 1013, 711, 778, 658, 712, 732, 680, 1274, 779)
+1. id_especialidade = 661
 
-Regras SQL:
+Regras SQL Athena/Presto:
 - NUNCA use SELECT *
-- Use Presto/Athena SQL (use DATE '...' para datas, regexp_like() para regex, TRY(CAST()) para conversões seguras)
-- Limite registros individuais com LIMIT (amostras: usar sample_size, demais: máx 20)
-- Use funções de agregação (COUNT, SUM, AVG) para relatórios
-- Para LIKE texto, use LOWER() para case-insensitive
-- Para campos de texto como anamnese/conduta use regexp_like() ou LOWER() LIKE '%termo%'
+- Use lower(coalesce(campo, '')) para busca textual.
+- Use regexp_like(lower(coalesce(campo, '')), 'padrao') para regex.
+- Use regexp_extract(lower(coalesce(campo, '')), 'padrao', 1) para evidência.
+- Use DATE 'YYYY-MM-DD' para datas literais.
+- Não misture agregações e colunas detalhadas no mesmo SELECT sem separar em CTE.
+- CTEs recomendadas para summary/rows: base -> texto_normalizado -> features -> score_calc -> classificado -> resumo -> SELECT final.
+- CTEs recomendadas para sample: base -> texto_normalizado -> features -> score_calc -> classificado -> amostra (com row_number()) -> SELECT final WHERE rn <= sample_size.
 """
+
+
+def _normalize_text_intent(text: str) -> str:
+    if not text:
+        return ""
+    import unicodedata
+    text = text.lower()
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_period(original_input: str, hoje: str) -> dict:
+    """
+    Extrai o período temporal da pergunta conforme implementado no nó 'Preparar Contrato SQL' do n8n.
+    """
+    text = _normalize_text_intent(original_input)
+    
+    try:
+        today = datetime.strptime(hoje, "%Y-%m-%d")
+    except Exception:
+        today = datetime.now()
+
+    def iso_date(d: datetime) -> str:
+        return d.strftime("%Y-%m-%d")
+
+    # 1. Base inteira solicitada
+    all_time_patterns = [
+        "base inteira", "sem filtro de periodo", "sem periodo",
+        "sem filtro temporal", "todo historico", "historico completo", "todos os dados"
+    ]
+    if any(p in text for p in all_time_patterns):
+        return {"status": "all_time_requested", "start": None, "end_exclusive": None, "sql_filter": ""}
+
+    # 2. Datas explícitas (YYYY-MM-DD ou DD/MM/YYYY)
+    date_matches_iso = re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", original_input)
+    date_matches_br = re.findall(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", original_input)
+    
+    explicit_dates = []
+    for m in date_matches_iso:
+        try:
+            explicit_dates.append(datetime(int(m[0]), int(m[1]), int(m[2])))
+        except:
+            pass
+    for m in date_matches_br:
+        try:
+            explicit_dates.append(datetime(int(m[2]), int(m[1]), int(m[0])))
+        except:
+            pass
+
+    if len(explicit_dates) >= 2:
+        start = explicit_dates[0]
+        end = explicit_dates[1] + timedelta(days=1)
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+    elif len(explicit_dates) == 1:
+        start = explicit_dates[0]
+        end = start + timedelta(days=1)
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+
+    # 3. Meses por extenso
+    months = {
+        "janeiro": 1, "fevereiro": 2, "marco": 3, "março": 3, "abril": 4,
+        "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+        "outubro": 10, "novembro": 11, "dezembro": 12
+    }
+    for month_name, month_index in months.items():
+        if month_name in text:
+            year_match = re.search(r"\b(20\d{2})\b", text)
+            year = int(year_match.group(1)) if year_match else today.year
+            start = datetime(year, month_index, 1)
+            if month_index == 12:
+                end = datetime(year + 1, 1, 1)
+            else:
+                end = datetime(year, month_index + 1, 1)
+            return {
+                "status": "period_found",
+                "start": iso_date(start),
+                "end_exclusive": iso_date(end),
+                "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+            }
+
+    # 4. Últimos N dias
+    last_days_match = re.search(r"\bultimos?\s+(\d+)\s+dias?\b", text)
+    if last_days_match:
+        days = max(1, int(last_days_match.group(1)))
+        start = today - timedelta(days=days)
+        end = today + timedelta(days=1)
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+
+    # 5. Hoje/Ontem
+    if "hoje" in text:
+        start = today
+        end = today + timedelta(days=1)
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+    if "ontem" in text:
+        start = today - timedelta(days=1)
+        end = today
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+
+    # 6. Mês atual / Mês passado
+    if any(p in text for p in ["mes atual", "este mes", "neste mes"]):
+        start = datetime(today.year, today.month, 1)
+        if today.month == 12:
+            end = datetime(today.year + 1, 1, 1)
+        else:
+            end = datetime(today.year, today.month + 1, 1)
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+    if "mes passado" in text:
+        if today.month == 1:
+            start = datetime(today.year - 1, 12, 1)
+            end = datetime(today.year, 1, 1)
+        else:
+            start = datetime(today.year, today.month - 1, 1)
+            end = datetime(today.year, today.month, 1)
+        return {
+            "status": "period_found",
+            "start": iso_date(start),
+            "end_exclusive": iso_date(end),
+            "sql_filter": f"data_atendimento >= DATE '{iso_date(start)}' AND data_atendimento < DATE '{iso_date(end)}'"
+        }
+
+    return {"status": "missing_period", "start": None, "end_exclusive": None, "sql_filter": None}
 
 
 def _generate_sql(query: str, rag_context: str, output_mode: str, sample_size: int, hoje: str) -> str:
     """
-    Usa o LLM para gerar uma query SQL válida para o Athena com base na pergunta do usuário
-    e nas regras clínicas do RAG.
+    Usa o LLM para gerar uma query SQL válida para o Athena com base na pergunta do usuário,
+    no contrato de dados do N8N e nas regras clínicas do RAG.
     """
+    period = _extract_period(query, hoje)
+    period_filter = f"\n3. Filtro temporal extraído: {period.get('sql_filter')}" if period.get("sql_filter") else ""
+    
     llm = get_chat_model_openai(temperature=0.0, model="gpt-4.1-mini")
 
-    system_prompt = f"""Você é um especialista em SQL para AWS Athena (Presto).
-Gere UMA ÚNICA consulta SQL para responder à pergunta do usuário sobre cirurgia de catarata.
+    system_prompt = f"""Você é um gerador de SQL Athena/Presto especializado em auditoria clínica de cirurgias de catarata.
+Gere UMA ÚNICA consulta SQL Athena limpa de acordo com o seguinte contrato:
 
 {CATARATA_SCHEMA}
 
-Output mode: {output_mode}
-- 'summary': Retorne apenas métricas agregadas (COUNT, SUM, percentuais). NÃO retorne linhas individuais.
-- 'rows': Retorne detalhes de atendimentos individuais com campos clínicos relevantes. Limite 20 linhas.
-- 'sample': Retorne {sample_size} registros individuais aleatórios com campos detalhados.
+Contrato de Execução:
+1. Tabela: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
+2. Filtro fixo obrigatório: id_especialidade = 661{period_filter}
+4. Modo de saída (output_mode): '{output_mode}'
+   - 'summary': Retorne apenas métricas agregadas agregadas no SELECT final:
+     - total_registros (COUNT)
+     - total_pacientes_unicos (COUNT DISTINCT id_paciente)
+     - positivos (soma de classificação = 'positivo')
+     - provaveis (soma de classificação = 'provável')
+     - negativos (soma de classificação = 'negativo')
+     - pos_operatorios (soma de classificação = 'pós-operatório')
+     - percentual_positivos, percentual_provaveis, percentual_negativos
+   - 'rows': Retorne as colunas agregadas acima E liste os detalhes das linhas individuais (com id_atendimento, id_paciente, data_atendimento, classificacao, score, campo_origem, termo_detectado, trecho_evidencia, cid_codigo_txt, flg_cirurgica, nome_profissional). Para retornar ambos juntos, use JOIN ou CROSS JOIN de forma limpa entre a CTE resumo e a CTE classificado. Limite as linhas de detalhes a 20.
+   - 'sample': Ignore agregações (total_registros, percentual, etc). Retorne apenas linhas detalhadas individuais de amostra. Para limitar a amostra de forma correta e sem usar LIMIT, use row_number() em uma CTE 'amostra' e filtre rn <= {sample_size} no SELECT final.
 
-Data de referência: {hoje}
-
-Regras de Cirurgia de Catarata (régua clínica do RAG):
+5. Chave Clínica (Régua de classificação RAG):
 {rag_context}
+
+Regras Cruciais:
+- NUNCA use SELECT *
+- Use lower(coalesce(campo, '')) para busca textual.
+- Nunca crie ou infira colunas que não existem no schema. Termos de RAG, léxicos, scores, etc., são construídos usando expressões lógicas (CASE WHEN) em CTEs e não são colunas físicas.
+- Não use ILIKE, ::tipo, QUALIFY, DATEADD, GETDATE, REGEXP_CONTAINS, TOP, SAFE_CAST, ou regexp_instr.
+- score e classificacao devem ser criados em CTEs progressivas. Nunca use um alias criado na mesma cláusula SELECT.
+- A data de referência atual é: {hoje}.
 
 RETORNE APENAS O SQL PURO, sem markdown, sem explicações, sem comentários."""
 
@@ -83,12 +287,23 @@ RETORNE APENAS O SQL PURO, sem markdown, sem explicações, sem comentários."""
 
 def _format_sql_result(results: list[dict], output_mode: str, sample_size: int) -> dict:
     """
-    Formata e estrutura os resultados brutos do Athena em um payload padronizado.
+    Formata e estrutura os resultados brutos do Athena em um payload padronizado,
+    idêntico ao processamento do N8N.
     """
     if not results:
         return {
             "execution_status": "success",
-            "summary": {},
+            "summary": {
+                "total_registros": 0,
+                "total_pacientes_unicos": 0,
+                "positivos": 0,
+                "provaveis": 0,
+                "negativos": 0,
+                "pos_operatorios": 0,
+                "percentual_positivos": 0.0,
+                "percentual_provaveis": 0.0,
+                "percentual_negativos": 0.0
+            },
             "rows": [],
             "row_count": 0,
             "truncated": False,
@@ -96,16 +311,25 @@ def _format_sql_result(results: list[dict], output_mode: str, sample_size: int) 
             "limitations": ["Nenhum registro encontrado para os critérios informados."]
         }
 
-    # Para modo summary, os resultados já são métricas agregadas
-    if output_mode == "summary":
-        summary = results[0] if len(results) == 1 else {}
-        # Se tiver múltiplas linhas de agregação, consolida
-        if len(results) > 1:
-            summary = {
-                "total_registros": len(results),
-                "dados": results
-            }
+    first = results[0]
+    
+    # Extrai o resumo analítico quantitativo
+    summary = {
+        "total_registros": first.get("total_registros") or first.get("total") or len(results),
+        "total_pacientes_unicos": first.get("total_pacientes_unicos") or first.get("pacientes_unicos"),
+        "positivos": first.get("positivos") or first.get("positivo"),
+        "provaveis": first.get("provaveis") or first.get("provável"),
+        "negativos": first.get("negativos") or first.get("negativo"),
+        "pos_operatorios": first.get("pos_operatorios") or first.get("pós_operatorios"),
+        "percentual_positivos": first.get("percentual_positivos") or first.get("pct_positivos"),
+        "percentual_provaveis": first.get("percentual_provaveis") or first.get("pct_provaveis"),
+        "percentual_negativos": first.get("percentual_negativos") or first.get("pct_negativos")
+    }
 
+    # Remove campos nulos/não preenchidos
+    summary = {k: v for k, v in summary.items() if v is not None}
+
+    if output_mode == "summary":
         return {
             "execution_status": "success",
             "summary": summary,
@@ -116,7 +340,7 @@ def _format_sql_result(results: list[dict], output_mode: str, sample_size: int) 
             "limitations": []
         }
 
-    # Para modos rows e sample, normaliza as linhas
+    # Para modos rows e sample, normaliza as linhas individuais de detalhes
     max_rows = sample_size if output_mode == "sample" else 20
     truncated = len(results) > max_rows
     rows_to_return = results[:max_rows]
@@ -140,7 +364,7 @@ def _format_sql_result(results: list[dict], output_mode: str, sample_size: int) 
 
     return {
         "execution_status": "success",
-        "summary": {"total_registros": len(results)},
+        "summary": summary if output_mode == "rows" else {"total_registros": len(results)},
         "rows": compact_rows,
         "row_count": len(results),
         "truncated": truncated,
@@ -209,7 +433,7 @@ def sql_analyst_expert(
         error_msg = str(e)
         logger.error(f"Erro ao executar SQL no Athena: {error_msg}")
 
-        # Retry: tenta uma única vez com o SQL corrigido pelo LLM
+        # Retry: tenta uma única vez com o SQL corrigido pelo LLM (compatibilidade N8N)
         if retry_count < 1:
             logger.info("SQL Analyst: Tentando corrigir SQL e reexecutar (retry 1)...")
             try:
@@ -217,7 +441,7 @@ def sql_analyst_expert(
                 fix_prompt = (
                     f"O SQL abaixo causou este erro no AWS Athena (Presto):\n\n"
                     f"SQL:\n{sql}\n\nErro:\n{error_msg}\n\n"
-                    f"Corrija o SQL para ser compatível com Presto/Athena. "
+                    f"Corrija o SQL para ser compatível com Presto/Athena e respeitar o schema de pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia. "
                     f"Retorne APENAS o SQL corrigido, sem markdown e sem explicações."
                 )
                 fix_response = llm.invoke([{"role": "user", "content": fix_prompt}])
@@ -259,3 +483,4 @@ def sql_analyst_expert(
             "sql": sql,
             "limitations": ["Execução SQL falhou."]
         }
+
