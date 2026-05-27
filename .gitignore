@@ -36,5 +36,3 @@ rag/
 
 # Tests
 tests/
-tests/*.py
-tests/

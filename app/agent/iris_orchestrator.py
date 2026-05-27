@@ -3,13 +3,12 @@ Iris Orchestrator — Deep Agent Principal
 
 Orquestrador do novo sistema Iris. Coordena os agentes especialistas e
 implementa o fluxo de raciocínio profundo (Multi-Agent Deep Architecture):
-  1. Pre-Router & Intent Analyzer
-  2. Loader de Aprendizados Curados
-  3. Clinical RAG Expert Agent
-  4. SQL Query Analyst & Executor Agent
-  5. Iris Synthesizer (LLM)
-  6. Quality Judge como metrica assincrona
-  7. Self-Learning & Persistent Logger
+  1. Loader de Aprendizados Curados
+  2. Clinical RAG Expert Agent
+  3. SQL Query Analyst & Executor Agent decide o formato da consulta
+  4. Iris Synthesizer (LLM)
+  5. Quality Judge como metrica assincrona
+  6. Self-Learning & Persistent Logger
 """
 
 import asyncio
@@ -23,7 +22,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
-from app.services.intent import detect_intent
 from app.services.learning import load_curated_lessons, generate_lessons_from_execution, save_learned_lessons
 from app.services.evaluation_store import save_execution_log
 from app.agent.evaluator import evaluate_response
@@ -57,7 +55,7 @@ Você receberá:
 - O contexto clínico (rag_context) com as regras da régua de catarata
 - Os dados quantitativos do banco de dados (sql_result)
 - Aprendizados preventivos do projeto (memory_context) como checklist operacional
-- Metadados de intenção (output_mode, sample_mode, wants_rows)
+- O plano de consulta resolvido pelo especialista SQL
 
 ## Uso dos Aprendizados do Projeto
 Os aprendizados são um checklist preventivo. Use-os para evitar erros recorrentes já identificados.
@@ -71,7 +69,7 @@ Não copie o texto dos aprendizados na resposta ao usuário.
 3. Nunca invente dados, totais, percentuais, pacientes, atendimentos, scores ou evidências.
 4. Nunca exponha a arquitetura interna, nomes de agentes, steps técnicos ou SQL bruto ao usuário (exceto se explicitamente solicitado).
 5. Se sql_result tiver erro ou estiver vazio: informe que não foi possível consultar os dados.
-6. Se output_mode="sample" ou sample_mode=true: retorne registros individuais sem resumo agregado.
+6. Se o resultado SQL trouxer registros individuais, preserve os detalhes relevantes na resposta.
 7. Para relatório/contagem: inclua total, estratificação e percentuais quando disponíveis.
 8. Se houver score, explique de forma simples os fatores que contribuíram.
 
@@ -123,7 +121,7 @@ def _truncate(text: Any, max_chars: int = 2500) -> str:
 
 def _build_synthesizer_prompt(
     user_question: str,
-    intent: dict,
+    query_plan: dict,
     rag_context: str,
     sql_result: dict,
     memory_context: str,
@@ -133,9 +131,7 @@ def _build_synthesizer_prompt(
     parts = [
         f"Pergunta: {user_question}",
         f"\nData de hoje: {hoje}",
-        f"\nOutput mode: {intent.get('output_mode', 'summary')}",
-        f"Sample mode: {intent.get('sample_mode', False)}",
-        f"Wants rows: {intent.get('wants_rows', False)}",
+        f"\nPlano de consulta: {json.dumps(query_plan or {}, ensure_ascii=False)}",
     ]
 
     if memory_context:
@@ -160,7 +156,7 @@ def _build_synthesizer_prompt(
 
 async def _iris_synthesize(
     user_question: str,
-    intent: dict,
+    query_plan: dict,
     rag_context: str,
     sql_result: dict,
     memory_context: str,
@@ -170,7 +166,7 @@ async def _iris_synthesize(
     """Invoca o LLM sintetizador e parseia o JSON de saída."""
     system = IRIS_SYNTHESIZER_SYSTEM
     user_content = _build_synthesizer_prompt(
-        user_question, intent, rag_context, sql_result,
+        user_question, query_plan, rag_context, sql_result,
         memory_context, hoje
     )
 
@@ -234,39 +230,16 @@ async def run_iris_agent(
     athena_results_context.set([])
     rag_results_context.set([])
 
-    # ── 1. Pre-Router & Intent Analyzer ──────────────────────────────────────
-    intent = detect_intent(message)
-    logger.info(f"Intent detectado: {intent}")
+    query_plan = {
+        "routing": "sql_specialist_decides",
+        "output_mode": None,
+        "sample_size": 5,
+    }
 
-    # ── 2. Loader de Aprendizados Curados ────────────────────────────────────
     memory_context = load_curated_lessons()
 
-    # ── 3. Histórico de sessão ───────────────────────────────────────────────
     history = get_session_history(effective_session)
     recent_messages = list(history.messages)[-8:]
-
-    # ── 4. Saudação simples — resposta rápida sem especialistas ─────────────
-    if intent.get("is_simple"):
-        greeting = "Olá, eu sou a Iris, em que posso te ajudar?"
-        history.add_user_message(message)
-        history.add_ai_message(greeting)
-        simple_result = {
-            "final_answer": greeting,
-            "analysis_type": "saudacao",
-            "periodo": {"inicio": None, "fim_exclusivo": None},
-            "unit_of_analysis": "nao_aplicavel",
-            "error": False, "errorType": None, "errorMessage": None,
-            "rag_used": False, "sql_used": False, "user_asked_for_sql": False,
-            "judge_passed": True, "judge_score": 1.0,
-            "job_id": job_id, "sessionId": effective_session, "conversationId": effective_conversation,
-            "originalInput": message, "validated": True, "has_data": False,
-            "final_delivery_policy": "delivered_without_blocking",
-        }
-        asyncio.create_task(_post_execution(job_id, effective_session, effective_conversation, message, simple_result, [], []))
-        yield greeting
-        return
-
-    # ── 5. Clinical RAG Expert Agent ─────────────────────────────────────────
     rag_context = ""
     loop = asyncio.get_event_loop()
     try:
@@ -287,8 +260,8 @@ async def run_iris_agent(
             _run_sql_analyst_in_thread,
             message,
             rag_context,
-            intent.get("output_mode", "summary"),
-            intent.get("sample_size") or 5,
+            None,
+            query_plan["sample_size"],
             hoje,
             0
         )
@@ -299,10 +272,15 @@ async def run_iris_agent(
         logger.error(f"SQL Analyst falhou: {e}")
         sql_result = {"execution_status": "error", "error": {"message": str(e)}, "rows": [], "summary": {}, "row_count": 0}
 
-    # ── 7. Iris Synthesizer ──────────────────────────────────────────────────
+    query_plan.update({
+        "query_shape": sql_result.get("query_shape"),
+        "output_mode": sql_result.get("output_mode"),
+        "intent_reason": sql_result.get("intent_reason"),
+    })
+
     try:
         synth_result = await _iris_synthesize(
-            message, intent, rag_context, sql_result,
+            message, query_plan, rag_context, sql_result,
             memory_context, recent_messages, hoje=hoje
         )
     except Exception as e:
