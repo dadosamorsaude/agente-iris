@@ -106,7 +106,10 @@ async def save_execution_log(
             "validated": result.get("validated", False),
             "has_data": result.get("has_data", False),
             "orchestration": result.get("orchestration", {}),
+            "final_delivery_policy": result.get("final_delivery_policy", "delivered_without_blocking"),
         }
+
+        judge_output = result.get("judge_output") or {}
 
         # Payload mapeado 100% conforme a estrutura de colunas do N8N (logging.json)
         payload = {
@@ -123,13 +126,13 @@ async def save_execution_log(
             "row_count": result.get("executor_row_count", 0),
             "judge_passed": result.get("judge_passed", False),
             "judge_score": float(result.get("judge_score") or 0.0),
-            "block_reason": result.get("errorType") if result.get("error") else None,
-            "issues": result.get("issues") or [],
+            "block_reason": judge_output.get("block_reason") or (result.get("errorType") if result.get("error") else None),
+            "issues": result.get("issues") or judge_output.get("issues") or [],
             "error": result.get("error", False),
             "error_type": result.get("errorType"),
             "metadata": meta_payload,
             "retry_count": result.get("retry_count", 0),
-            "max_retries": 1,
+            "max_retries": 0,
             "score_final": float(result.get("judge_score") or 0.0) * 100.0,  # converte de volta para escala 0-100 para o Metabase
         }
 

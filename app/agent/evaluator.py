@@ -107,7 +107,7 @@ async def evaluate_response(
     """
     if not raw_athena_data and not rag_context:
         logger.warning("Avaliador: nenhum dado bruto do Athena nem RAG disponível.")
-        return _empty_evaluation("Nenhum dado do Athena ou RAG disponível para avaliar.")
+        return _unavailable_metric("Nenhum dado do Athena ou RAG disponivel para avaliar.", reason_type="not_applicable")
 
     # Formata dados do Athena
     raw_data_str = json.dumps(raw_athena_data or [], ensure_ascii=False, indent=2, default=str)
@@ -157,6 +157,13 @@ async def evaluate_response(
         
         # Garante normalizações de score e aprovação idênticas ao processamento do N8N
         score = parsed.get("overall_score", 0.0)
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            score = 0.0
+        if score > 1.0:
+            score = score / 100.0
+        score = max(0.0, min(1.0, score))
         should_block = parsed.get("should_block_callback", False)
         
         # Aprovado se não bloqueado E score >= 0.75
@@ -175,7 +182,9 @@ async def evaluate_response(
             "evaluated_at": datetime.utcnow().isoformat(),
             "model": settings.MODEL_NAME,
             "had_rag_context": bool(rag_context),
-            "had_athena_data": bool(raw_athena_data)
+            "had_athena_data": bool(raw_athena_data),
+            "metric_only": True,
+            "metric_available": True
         }
 
         logger.info(
@@ -186,23 +195,28 @@ async def evaluate_response(
 
     except json.JSONDecodeError as e:
         logger.error(f"Avaliador: resposta do LLM não é JSON válido: {e}")
-        return _empty_evaluation(f"Falha ao parsear resposta do avaliador: {e}")
+        return _unavailable_metric(f"Falha ao parsear resposta do avaliador: {e}")
 
     except Exception as e:
         logger.exception("Avaliador: erro ao invocar LLM avaliador")
-        return _empty_evaluation(f"Erro interno no avaliador: {e}")
+        return _unavailable_metric(f"Erro interno no avaliador: {e}")
 
 
-def _empty_evaluation(reason: str) -> dict:
-    """Retorna uma avaliação vazia com score 0 quando não é possível avaliar."""
+def _unavailable_metric(reason: str, reason_type: str = "judge_unavailable") -> dict:
+    """Retorna uma metrica indisponivel sem bloquear a execucao principal."""
     return {
-        "judge_passed": False,
-        "overall_score": 0.0,
-        "should_block_callback": True,
-        "block_reason": "judge_parse_error",
-        "issues": [{"tipo": "judge_parse_error", "severidade": "alto", "message": reason}],
+        "judge_passed": None,
+        "overall_score": None,
+        "score": None,
+        "should_block_callback": False,
+        "block_reason": reason_type,
+        "issues": [{"tipo": reason_type, "severidade": "baixo", "message": reason}],
         "justificativa": reason,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "model": settings.MODEL_NAME,
+        "metric_only": True,
+        "metric_available": False,
     }
 
+
+_empty_evaluation = _unavailable_metric

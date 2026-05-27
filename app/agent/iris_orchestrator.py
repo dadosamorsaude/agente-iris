@@ -8,7 +8,7 @@ implementa o fluxo de raciocínio profundo (Multi-Agent Deep Architecture):
   3. Clinical RAG Expert Agent
   4. SQL Query Analyst & Executor Agent
   5. Iris Synthesizer (LLM)
-  6. Quality Judge & Critic Agent (Loop de Retry Síncrono)
+  6. Quality Judge como metrica assincrona
   7. Self-Learning & Persistent Logger
 """
 
@@ -89,14 +89,6 @@ Não copie o texto dos aprendizados na resposta ao usuário.
   "user_asked_for_sql": false
 }"""
 
-IRIS_RETRY_SYSTEM = """Você é a Iris. Você está em MODO RETRY PÓS-JUDGE para corrigir sua resposta anterior.
-
-Use a crítica do Judge como checklist de correção.
-Use APENAS os dados já disponíveis em sql_result, rag_context e retry_context.
-Não invente novos dados. Não exponha o Judge ou a arquitetura interna.
-Se os dados disponíveis forem insuficientes para corrigir, informe isso claramente.
-Preserve o formato JSON obrigatório."""
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -135,8 +127,6 @@ def _build_synthesizer_prompt(
     rag_context: str,
     sql_result: dict,
     memory_context: str,
-    is_retry: bool = False,
-    retry_context: str = "",
     hoje: str = "",
 ) -> str:
     """Monta o prompt completo do usuário para o Iris Synthesizer."""
@@ -161,10 +151,6 @@ def _build_synthesizer_prompt(
         else:
             parts.append(f"\nResultado SQL:\n{_truncate(sql_result, 3000)}")
 
-    if is_retry and retry_context:
-        parts.append(f"\nMODO RETRY — Crítica do Judge:\n{retry_context}")
-        parts.append("\nInstrução: Corrija a resposta anterior usando apenas os dados acima. Não invente dados.")
-
     return "\n".join(parts)
 
 
@@ -179,15 +165,13 @@ async def _iris_synthesize(
     sql_result: dict,
     memory_context: str,
     history_messages: list,
-    is_retry: bool = False,
-    retry_context: str = "",
     hoje: str = "",
 ) -> dict:
     """Invoca o LLM sintetizador e parseia o JSON de saída."""
-    system = IRIS_RETRY_SYSTEM if is_retry else IRIS_SYNTHESIZER_SYSTEM
+    system = IRIS_SYNTHESIZER_SYSTEM
     user_content = _build_synthesizer_prompt(
         user_question, intent, rag_context, sql_result,
-        memory_context, is_retry, retry_context, hoje
+        memory_context, hoje
     )
 
     messages = [SystemMessage(content=system)] + history_messages + [HumanMessage(content=user_content)]
@@ -276,6 +260,7 @@ async def run_iris_agent(
             "judge_passed": True, "judge_score": 1.0,
             "job_id": job_id, "sessionId": effective_session, "conversationId": effective_conversation,
             "originalInput": message, "validated": True, "has_data": False,
+            "final_delivery_policy": "delivered_without_blocking",
         }
         asyncio.create_task(_post_execution(job_id, effective_session, effective_conversation, message, simple_result, [], []))
         yield greeting
@@ -331,73 +316,7 @@ async def run_iris_agent(
 
     synth_result["rag_used"] = rag_used
     synth_result["sql_used"] = sql_used
-
-    # ── 8. Quality Judge & Retry Síncrono (apenas em stream=False) ───────────
-    if not stream and not synth_result.get("error") and (rag_used or sql_used):
-        raw_athena = athena_results_context.get([])
-        raw_rag = rag_results_context.get([])
-
-        try:
-            evaluation = await evaluate_response(
-                user_question=message,
-                agent_response=synth_result.get("final_answer", ""),
-                raw_athena_data=raw_athena,
-                rag_context=raw_rag,
-            )
-
-            judge_passed = evaluation.get("judge_passed", evaluation.get("aprovado", False))
-            judge_score = evaluation.get("overall_score", evaluation.get("score", 0) / 100.0)
-            if judge_score > 1.0:
-                judge_score = judge_score / 100.0
-                
-            synth_result["judge_passed"] = judge_passed
-            synth_result["judge_score"] = judge_score
-            synth_result["judge_output"] = evaluation
-
-            logger.info(f"Judge concluído | aprovado={judge_passed} | score={judge_score}")
-
-            # Retry se reprovado
-            if not judge_passed and judge_score < 0.75:
-                logger.info("Judge reprovou. Iniciando Retry da Iris...")
-                judge_critique = {
-                    "judge_passed": judge_passed,
-                    "judge_score": judge_score,
-                    "issues": evaluation.get("issues", evaluation.get("erros_encontrados", [])),
-                    "feedback": evaluation.get("justificativa", ""),
-                }
-                retry_context_str = json.dumps({
-                    "tipo": "retry_pos_judge",
-                    "instrucao": "Corrija a resposta anterior com base na crítica do Judge.",
-                    "critica_do_judge": judge_critique,
-                    "resposta_anterior": synth_result.get("final_answer", ""),
-                    "query_result": sql_result,
-                    "rag_context": rag_context[:1000],
-                }, ensure_ascii=False)[:2500]
-
-                try:
-                    retry_result = await _iris_synthesize(
-                        message, intent, rag_context, sql_result,
-                        memory_context, recent_messages,
-                        is_retry=True, retry_context=retry_context_str, hoje=hoje
-                    )
-                    retry_result["rag_used"] = rag_used
-                    retry_result["sql_used"] = sql_used
-                    retry_result["judge_passed"] = judge_passed
-                    retry_result["judge_score"] = judge_score
-                    retry_result["judge_output"] = evaluation
-                    retry_result["retry_applied"] = True
-                    retry_result["retry_count"] = 1
-                    synth_result = retry_result
-                    logger.info("Retry da Iris concluído.")
-                except Exception as retry_err:
-                    logger.error(f"Retry falhou: {retry_err}")
-        except Exception as judge_err:
-            logger.error(f"Judge falhou: {judge_err}")
-            synth_result.setdefault("judge_passed", None)
-            synth_result.setdefault("judge_score", None)
-
-    # ── 9. Monta o resultado final completo ───────────────────────────────────
-    final_answer = synth_result.get("final_answer", "Não foi possível gerar uma resposta.")
+    final_answer = synth_result.get("final_answer", "Nao foi possivel gerar uma resposta.")
     synth_result.update({
         "job_id": job_id,
         "sessionId": effective_session,
@@ -408,13 +327,12 @@ async def run_iris_agent(
         "executor_row_count": sql_result.get("row_count", 0),
         "executor_summary": sql_result.get("summary", {}),
         "query_result": sql_result if sql_used else None,
+        "final_delivery_policy": "delivered_without_blocking",
     })
 
-    # Persiste histórico
     history.add_user_message(message)
     history.add_ai_message(final_answer)
 
-    # ── 10. Post-Execution em background (auto-learning + logging) ────────────
     raw_athena = athena_results_context.get([])
     raw_rag = rag_results_context.get([])
     asyncio.create_task(_post_execution(
@@ -425,7 +343,6 @@ async def run_iris_agent(
     yield final_answer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Post-Execution: Auto-Learning + Logging (background)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -440,7 +357,26 @@ async def _post_execution(
 ) -> None:
     """Executa as tarefas de logging e auto-learning em background."""
     try:
-        # Auto-Learning: gera e salva lições
+        # Judge apenas metrifica; nunca bloqueia nem altera a resposta entregue.
+        if result.get("judge_output") is None and (raw_athena or raw_rag):
+            evaluation = await evaluate_response(
+                user_question=original_input,
+                agent_response=result.get("final_answer", result.get("output", "")),
+                raw_athena_data=raw_athena,
+                rag_context=raw_rag,
+            )
+            judge_score = evaluation.get("overall_score")
+            if isinstance(judge_score, (int, float)) and judge_score > 1:
+                judge_score = judge_score / 100.0
+
+            result["judge_output"] = evaluation
+            result["judge_passed"] = evaluation.get("judge_passed")
+            result["judge_score"] = judge_score
+            result["issues"] = evaluation.get("issues", [])
+
+        result.setdefault("final_delivery_policy", "delivered_without_blocking")
+
+        # Auto-Learning: gera e salva lições a partir das métricas coletadas.
         lessons = generate_lessons_from_execution(result)
         if lessons:
             loop = asyncio.get_event_loop()
