@@ -22,6 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
+from app.core.observability import get_langfuse_callbacks
 from app.services.learning import load_curated_lessons, generate_lessons_from_execution, save_learned_lessons
 from app.services.evaluation_store import save_execution_log
 from app.agent.evaluator import evaluate_response
@@ -97,6 +98,7 @@ def _get_llm(temperature: float = 0.0) -> ChatOpenAI:
         model=settings.MODEL_NAME,
         temperature=temperature,
         api_key=settings.OPENAI_API_KEY,
+        callbacks=get_langfuse_callbacks(),
     )
 
 

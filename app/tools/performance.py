@@ -1,5 +1,5 @@
 from typing import Optional
-from langsmith import traceable
+from app.core.observability import traceable
 from app.skills.performance_audit import performance_audit_skill
 from app.tools.athena import query_athena_tool
 from app.core.logger import logger

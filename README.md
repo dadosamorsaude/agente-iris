@@ -9,7 +9,7 @@ Agente de IA especializado em análise de prontuários médicos e conformidade c
 - **Streaming de Tokens**: Interface interativa com resposta em tempo real.
 - **Segurança**: Proteção via API Key (`X-API-Key`) e configuração de CORS para integração com Lovable.
 - **Memória Persistente**: Histórico de chat armazenado em PostgreSQL (Supabase) com suporte a sessões via UUID.
-- **Observabilidade**: Tracing completo via LangSmith e logs estruturados com Loguru.
+- **Observabilidade**: Tracing via Langfuse e logs estruturados com Loguru.
 
 ## 🛠️ Tecnologias Utilizadas
 

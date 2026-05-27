@@ -12,6 +12,9 @@ iris.json
 *.html
 *
 *.json
+!app/
+!app/core/
+!app/core/observability.py
 
 # Python-generated files
 __pycache__/

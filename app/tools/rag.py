@@ -3,7 +3,7 @@ from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.tools import tool
-from langsmith import traceable
+from app.core.observability import traceable
 from app.core.config import settings
 
 rag_results_context: ContextVar[list] = ContextVar("rag_results", default=[])

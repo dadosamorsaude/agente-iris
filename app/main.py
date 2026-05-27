@@ -11,7 +11,7 @@ import time
 import os
 from dotenv import load_dotenv
 
-# Carrega arquivos .env pro os.environ (essencial pro LangSmith enxergar as chaves no ambiente)
+# Carrega arquivos .env pro os.environ (incluindo chaves de observabilidade)
 load_dotenv(override=True)
 
 app = FastAPI(

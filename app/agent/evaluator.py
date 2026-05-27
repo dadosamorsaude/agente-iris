@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
+from app.core.observability import get_langfuse_callbacks
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ def _get_evaluator_llm() -> ChatOpenAI:
         model=settings.MODEL_NAME,
         temperature=0.0,
         api_key=settings.OPENAI_API_KEY,
+        callbacks=get_langfuse_callbacks(),
     )
 
 

@@ -3,7 +3,7 @@ from contextvars import ContextVar
 from pyathena import connect
 from app.core.config import settings
 from langchain_core.tools import tool
-from langsmith import traceable
+from app.core.observability import traceable
 import logging
 
 logger = logging.getLogger(__name__)

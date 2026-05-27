@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     DATABASE_URL: Optional[str] = None  # postgresql://user:password@host:5432/dbname
     DATABASE_API_KEY: Optional[str] = None
 
+    # Observability - Langfuse
+    LANGFUSE_SECRET_KEY: Optional[str] = None
+    LANGFUSE_PUBLIC_KEY: Optional[str] = None
+    LANGFUSE_BASE_URL: Optional[str] = None
+
     @property
     def supabase_rest_url(self) -> Optional[str]:
         if not self.DATABASE_URL:

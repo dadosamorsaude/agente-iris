@@ -1,5 +1,5 @@
 from langchain_core.tools import tool
-from langsmith import traceable
+from app.core.observability import traceable
 from app.services.transcription import transcribe_audio
 import logging
 import os
