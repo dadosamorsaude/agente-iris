@@ -4,6 +4,7 @@ import logging
 from app.core.observability import get_langsmith_callbacks, traceable
 from app.tools.rag import get_retriever, rag_results_context, format_docs
 from app.services.llm import get_chat_model_openai
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +13,12 @@ logger = logging.getLogger(__name__)
 async def clinical_rag_expert(query: str) -> str:
     logger.info(f"Clinical RAG Expert consultando RAG Catarata para query: '{query}'")
 
-    retriever_treinamento = get_retriever("rag-agente-cirurgias", "treinamento_ia_catarata", k=4)
-    retriever_vocabulario = get_retriever("rag-agente-cirurgias", "catarata_vocabulario_expandido", k=4)
+    retriever_treinamento = get_retriever(
+        settings.PINECONE_RAG_INDEX, settings.PINECONE_NS_TREINAMENTO, k=4
+    )
+    retriever_vocabulario = get_retriever(
+        settings.PINECONE_RAG_INDEX, settings.PINECONE_NS_VOCABULARIO, k=4
+    )
 
     if not retriever_treinamento or not retriever_vocabulario:
         logger.warning("Pinecone não configurado. RAG Expert indisponível.")

@@ -43,7 +43,7 @@ DETAIL_TERMS = [
 AGGREGATION_TERMS = [
     "quantos", "quantas", "quantidade", "contagem", "total", "soma",
     "media", "percentual", "porcentagem", "distribuicao", "agregado",
-    "consolidado", "relatorio"
+    "consolidado", "relatorio", "relatoiro",
 ]
 
 

@@ -286,9 +286,7 @@ async def run_iris_agent(
         return
 
     should_use_rag = not intent["is_simple"]
-    should_use_sql = not intent["is_simple"] and (
-        intent["has_aggregation_intent"] or intent["wants_rows"] or intent["sample_mode"]
-    )
+    should_use_sql = not intent["is_simple"]
 
     query_plan = {
         "routing": "agent_decides_tools",

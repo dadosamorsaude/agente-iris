@@ -26,11 +26,11 @@ class Settings(BaseSettings):
 
     # Pinecone Settings
     PINECONE_API_KEY: Optional[str] = None
-    PINECONE_INDEX_CFM: Optional[str] = None
-    PINECONE_INDEX_POP: Optional[str] = None
-    PINECONE_INDEX_TRAIN: Optional[str] = None
-    PINECONE_INDEX_EXPANSE: Optional[str] = None
+    PINECONE_RAG_INDEX: str = "rag-agente-cirurgias"
+    PINECONE_NS_TREINAMENTO: str = "treinamento_ia_catarata"
+    PINECONE_NS_VOCABULARIO: str = "catarata_vocabulario_expandido"
     PINECONE_INDEX_CACHE: Optional[str] = None
+    PINECONE_CACHE_NAMESPACE: str = "iris"
 
     # Security
     AGENTE_API_KEY: str

@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 class PineconeSemanticCache:
     def __init__(self):
         self.enabled = bool(settings.PINECONE_API_KEY and getattr(settings, 'PINECONE_INDEX_CACHE', None))
+        self.namespace = settings.PINECONE_CACHE_NAMESPACE
         if self.enabled:
             try:
                 self.pc = Pinecone(api_key=settings.PINECONE_API_KEY)
@@ -27,14 +28,17 @@ class PineconeSemanticCache:
         if not self.enabled: return None
         try:
             vector = await self.embeddings.aembed_query(query)
-            result = self.index.query(vector=vector, top_k=1, include_metadata=True)
+            result = self.index.query(
+                vector=vector, top_k=1, include_metadata=True,
+                namespace=self.namespace,
+            )
             
             if result.matches and result.matches[0].score >= threshold:
                 score_str = f"{result.matches[0].score:.4f}"
-                logger.info(f"🟢 Semantic Cache HIT! (Similaridade: {score_str})")
+                logger.info(f"Semantic Cache HIT! (Similaridade: {score_str})")
                 return result.matches[0].metadata
             
-            logger.info("🟡 Semantic Cache MISS")
+            logger.info("Semantic Cache MISS")
             return None
         except Exception as e:
             logger.error(f"Erro no cache semantico (get): {e}")
@@ -42,6 +46,9 @@ class PineconeSemanticCache:
             
     async def set(self, query: str, response: str, athena_data: list = None, rag_data: list = None):
         if not self.enabled: return
+        if not athena_data:
+            logger.info("Cache semantico: skipping (sem dados do Athena)")
+            return
         try:
             vector = await self.embeddings.aembed_query(query)
             metadata = {
@@ -53,9 +60,9 @@ class PineconeSemanticCache:
             self.index.upsert(vectors=[{
                 "id": str(uuid.uuid4()),
                 "values": vector,
-                "metadata": metadata
-            }])
-            logger.info("🔵 Semantic Cache atualizado com a nova resposta e metadados.")
+                "metadata": metadata,
+            }], namespace=self.namespace)
+            logger.info("Semantic Cache atualizado com a nova resposta e metadados.")
         except Exception as e:
             logger.error(f"Erro no cache semantico (set): {e}")
 
