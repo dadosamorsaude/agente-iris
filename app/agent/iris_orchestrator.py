@@ -353,7 +353,6 @@ async def run_iris_agent(
                 query_plan["output_mode"],
                 query_plan["sample_size"],
                 hoje,
-                0,
             )
             captured_athena = athena_results_context.get([])
             athena_results_context.set(captured_athena)

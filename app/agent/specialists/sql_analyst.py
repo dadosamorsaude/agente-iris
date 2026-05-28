@@ -760,20 +760,13 @@ async def sql_analyst_expert(
     output_mode: Optional[str] = None,
     sample_size: int = 5,
     hoje: str = "",
-    retry_count: int = 0,
 ) -> dict:
     """
     Especialista SQL para o sistema Iris.
 
     Gera, valida e executa uma query Athena, retornando payload estruturado.
-
-    Comportamento novo:
-    - Se output_mode vier vazio, None ou genérico, o agente decide a intenção
-      automaticamente.
-    - Se o usuário pedir amostra/listagem/detalhes, o SQL não pode ser agregado.
-    - Se o SQL for semanticamente incompatível com o pedido, o agente regenera
-      antes de executar.
-    - Se a execução no Athena falhar, tenta corrigir uma única vez.
+    Em caso de falha de execução, tenta corrigir o SQL automaticamente
+    (até 3 tentativas no total).
     """
     hoje = hoje or date.today().strftime("%Y-%m-%d")
 
@@ -863,114 +856,80 @@ async def sql_analyst_expert(
             "limitations": [str(e)],
         }
 
-    try:
-        results = await _execute_query(sql)
+    current_sql = sql
+    last_error = ""
+    max_attempts = 3
 
-        captured = athena_results_context.get([])
-        athena_results_context.set(captured + [{"sql": sql, "results": results}])
+    for attempt in range(max_attempts):
+        try:
+            results = await _execute_query(current_sql)
 
-        payload = _format_sql_result(
-            results=results,
-            output_mode=resolved_output_mode,
-            sample_size=sample_size,
-            query_shape=query_shape,
-            detail_limit=detail_limit,
-        )
+            captured = athena_results_context.get([])
+            athena_results_context.set(captured + [{"sql": current_sql, "results": results}])
 
-        payload["sql"] = sql
-        payload["query_shape"] = query_shape
-        payload["output_mode"] = resolved_output_mode
-        payload["intent_reason"] = intent.get("reason")
+            payload = _format_sql_result(
+                results=results,
+                output_mode=resolved_output_mode,
+                sample_size=sample_size,
+                query_shape=query_shape,
+                detail_limit=detail_limit,
+            )
 
-        logger.info(
-            "SQL Analyst: Execução bem-sucedida | "
-            f"query_shape={query_shape} | "
-            f"row_count={payload.get('row_count')}"
-        )
+            payload["sql"] = current_sql
+            payload["query_shape"] = query_shape
+            payload["output_mode"] = resolved_output_mode
+            payload["intent_reason"] = intent.get("reason")
 
-        return payload
+            if attempt > 0:
+                payload["limitations"] = payload.get("limitations", []) + [
+                    f"SQL foi auto-corrigido na tentativa {attempt + 1}."
+                ]
 
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Erro ao executar SQL no Athena: {error_msg}")
+            logger.info(
+                "SQL Analyst: Execução bem-sucedida | "
+                f"query_shape={query_shape} | "
+                f"row_count={payload.get('row_count')} | "
+                f"tentativa={attempt + 1}"
+            )
 
-        # Retry: tenta uma única vez com SQL corrigido pelo LLM
-        if retry_count < 1:
-            logger.info("SQL Analyst: Tentando corrigir SQL e reexecutar (retry 1)...")
+            return payload
 
-            try:
-                fixed_sql = await _repair_sql_for_execution(
-                    original_sql=sql,
-                    error_msg=error_msg,
+        except Exception as e:
+            last_error = str(e)
+            logger.error(
+                f"SQL Analyst: Tentativa {attempt + 1}/{max_attempts} falhou: {last_error}"
+            )
+
+            if attempt < max_attempts - 1:
+                logger.info(f"SQL Analyst: Corrigindo SQL e reexecutando (tentativa {attempt + 2})...")
+                current_sql = await _repair_sql_for_execution(
+                    original_sql=current_sql,
+                    error_msg=last_error,
                     query=query,
                     query_shape=query_shape,
                     output_mode=resolved_output_mode,
                     sample_size=sample_size,
                     detail_limit=detail_limit,
                 )
+                _semantic_validate_sql(current_sql, query_shape, query)
+                validate_sql(current_sql)
 
-                _semantic_validate_sql(fixed_sql, query_shape, query)
-                validate_sql(fixed_sql)
+    logger.error(f"SQL Analyst: Todas as {max_attempts} tentativas falharam")
 
-                results = await _execute_query(fixed_sql)
-
-                captured = athena_results_context.get([])
-                athena_results_context.set(captured + [{"sql": fixed_sql, "results": results}])
-
-                payload = _format_sql_result(
-                    results=results,
-                    output_mode=resolved_output_mode,
-                    sample_size=sample_size,
-                    query_shape=query_shape,
-                    detail_limit=detail_limit,
-                )
-
-                payload["sql"] = fixed_sql
-                payload["query_shape"] = query_shape
-                payload["output_mode"] = resolved_output_mode
-                payload["intent_reason"] = intent.get("reason")
-                payload["limitations"] = payload.get("limitations", []) + [
-                    "SQL foi auto-corrigido na execução."
-                ]
-
-                logger.info(
-                    "SQL Analyst: Retry bem-sucedido | "
-                    f"query_shape={query_shape} | "
-                    f"row_count={payload.get('row_count')}"
-                )
-
-                return payload
-
-            except Exception as retry_err:
-                logger.error(f"SQL Analyst: Retry também falhou: {retry_err}")
-
-                return {
-                    "execution_status": "error",
-                    "error": {
-                        "type": "sql_executor_error",
-                        "message": f"Original: {error_msg}. Retry: {retry_err}",
-                    },
-                    "summary": {},
-                    "rows": [],
-                    "row_count": 0,
-                    "sql": sql,
-                    "query_shape": query_shape,
-                    "output_mode": resolved_output_mode,
-                    "intent_reason": intent.get("reason"),
-                    "limitations": [
-                        "Execução SQL falhou mesmo após tentativa de autocorreção."
-                    ],
-                }
-
-        return {
-            "execution_status": "error",
-            "error": {"type": "sql_executor_error", "message": error_msg},
-            "summary": {},
-            "rows": [],
-            "row_count": 0,
-            "sql": sql,
-            "query_shape": query_shape,
-            "output_mode": resolved_output_mode,
-            "intent_reason": intent.get("reason"),
-            "limitations": ["Execução SQL falhou."],
-        }
+    return {
+        "execution_status": "error",
+        "error": {
+            "type": "sql_executor_error",
+            "message": f"Todas as {max_attempts} tentativas falharam. Último erro: {last_error}",
+        },
+        "summary": {},
+        "rows": [],
+        "row_count": 0,
+        "sql": sql,
+        "query_shape": query_shape,
+        "output_mode": resolved_output_mode,
+        "intent_reason": intent.get("reason"),
+        "limitations": [
+            "Execução SQL falhou mesmo após tentativa de autocorreção."
+        ],
+    }
