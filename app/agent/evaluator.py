@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
-from app.core.observability import get_langfuse_callbacks
+from app.core.observability import get_langfuse_callbacks, traceable
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ def _get_evaluator_llm() -> ChatOpenAI:
     )
 
 
+@traceable(name="judge_metric", as_type="span")
 async def evaluate_response(
     user_question: str,
     agent_response: str,
@@ -141,10 +142,13 @@ async def evaluate_response(
 
     try:
         llm = _get_evaluator_llm()
-        response = await llm.ainvoke([
-            {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ])
+        response = await llm.ainvoke(
+            [
+                {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            config={"callbacks": get_langfuse_callbacks()},
+        )
 
         raw_content = response.content.strip()
 

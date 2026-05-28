@@ -1,10 +1,12 @@
 import logging
 import json
+from app.core.observability import get_langfuse_callbacks, traceable
 from app.tools.rag import get_retriever, rag_results_context, format_docs
 from app.services.llm import get_chat_model_openai
 
 logger = logging.getLogger(__name__)
 
+@traceable(name="clinical_rag_expert", as_type="span")
 def clinical_rag_expert(query: str) -> str:
     """
     Especialista clínico em RAG Catarata.
@@ -121,10 +123,13 @@ def clinical_rag_expert(query: str) -> str:
     )
     
     try:
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
+        response = llm.invoke(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            config={"callbacks": get_langfuse_callbacks()},
+        )
         rag_context = response.content.strip()
         logger.info("Clinical RAG Expert consolidou com sucesso o JSON estruturado do RAG.")
         return rag_context
@@ -139,4 +144,3 @@ def clinical_rag_expert(query: str) -> str:
             "scoring": {"regras": [], "limiares": {}}
         }
         return json.dumps(fallback, ensure_ascii=False)
-

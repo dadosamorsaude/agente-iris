@@ -14,6 +14,7 @@ implementa o fluxo de raciocínio profundo (Multi-Agent Deep Architecture):
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import date
 from typing import AsyncGenerator, Any
@@ -22,7 +23,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
-from app.core.observability import get_langfuse_callbacks
+from app.core.observability import flush_langfuse, get_langfuse_callbacks, traceable
 from app.services.learning import load_curated_lessons, generate_lessons_from_execution, save_learned_lessons
 from app.services.evaluation_store import save_execution_log
 from app.agent.evaluator import evaluate_response
@@ -33,6 +34,127 @@ from app.tools.athena import athena_results_context
 from app.tools.rag import rag_results_context
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_for_gate(text: str) -> str:
+    import unicodedata
+
+    normalized = text.lower()
+    normalized = "".join(
+        c for c in unicodedata.normalize("NFD", normalized)
+        if unicodedata.category(c) != "Mn"
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _classify_light_interaction(message: str) -> str | None:
+    text = _normalize_for_gate(message)
+
+    greetings = {
+        "oi",
+        "ola",
+        "olá",
+        "bom dia",
+        "boa tarde",
+        "boa noite",
+        "e ai",
+        "eai",
+        "hello",
+        "hi",
+        "ping",
+    }
+    if text in greetings:
+        return "Olá, eu sou a Iris, em que posso te ajudar?"
+
+    help_terms = {
+        "ajuda",
+        "help",
+        "comandos",
+        "como funciona",
+        "o que voce faz",
+        "o que você faz",
+    }
+    if text in help_terms:
+        return (
+            "Eu posso ajudar com análises de cirurgia de catarata, prontuários, "
+            "classificações, evidências, contagens e relatórios clínicos."
+        )
+
+    thanks = {"obrigado", "obrigada", "valeu", "muito obrigado", "muito obrigada"}
+    if text in thanks:
+        return "Disponha. Se precisar de uma análise, é só me enviar o pedido."
+
+    return None
+
+
+def _needs_rag_context(message: str) -> bool:
+    text = _normalize_for_gate(message)
+    terms = {
+        "criterio",
+        "criterios",
+        "regra",
+        "regras",
+        "classificacao",
+        "classificar",
+        "score",
+        "scoring",
+        "evidencia",
+        "evidencias",
+        "catarata",
+        "cirurgia",
+        "prontuario",
+        "prontuarios",
+        "conduta",
+        "anamnese",
+        "cid",
+        "diagnostico",
+        "diagnostica",
+        "qualidade",
+        "auditoria",
+        "conformidade",
+    }
+    return any(term in text for term in terms)
+
+
+def _needs_data_query(message: str) -> bool:
+    text = _normalize_for_gate(message)
+    terms = {
+        "quantos",
+        "quantas",
+        "total",
+        "percentual",
+        "porcentagem",
+        "taxa",
+        "media",
+        "contagem",
+        "distribuicao",
+        "ranking",
+        "evolucao",
+        "liste",
+        "listar",
+        "lista",
+        "mostre",
+        "mostrar",
+        "traga",
+        "retorne",
+        "casos",
+        "registros",
+        "linhas",
+        "pacientes",
+        "atendimentos",
+        "amostra",
+        "exemplos",
+        "base",
+        "dados",
+        "tabela",
+        "relatorio",
+        "clinica",
+        "regional",
+        "profissional",
+        "prontuario",
+        "prontuarios",
+    }
+    return any(term in text for term in terms) or bool(re.search(r"\b\d{5,}\b", text))
 
 
 def _run_clinical_rag_in_thread(query: str):
@@ -54,9 +176,9 @@ IRIS_SYNTHESIZER_SYSTEM = """Você é a Iris, agente orquestrador principal do s
 Você receberá:
 - A pergunta original do usuário
 - O contexto clínico (rag_context) com as regras da régua de catarata
-- Os dados quantitativos do banco de dados (sql_result)
+- Os dados do banco de dados (sql_result), quando a pergunta exigir consulta
 - Aprendizados preventivos do projeto (memory_context) como checklist operacional
-- O plano de consulta resolvido pelo especialista SQL
+- O plano de ferramentas escolhidas para a intera??o
 
 ## Uso dos Aprendizados do Projeto
 Os aprendizados são um checklist preventivo. Use-os para evitar erros recorrentes já identificados.
@@ -156,6 +278,7 @@ def _build_synthesizer_prompt(
 # Iris Synthesizer (chamada ao LLM)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@traceable(name="iris_synthesize", as_type="span")
 async def _iris_synthesize(
     user_question: str,
     query_plan: dict,
@@ -175,8 +298,7 @@ async def _iris_synthesize(
     messages = [SystemMessage(content=system)] + history_messages + [HumanMessage(content=user_content)]
 
     llm = _get_llm()
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(None, llm.invoke, messages)
+    response = await llm.ainvoke(messages, config={"callbacks": get_langfuse_callbacks()})
 
     raw = response.content.strip() if hasattr(response, "content") else str(response)
     parsed = _safe_json(raw)
@@ -232,47 +354,100 @@ async def run_iris_agent(
     athena_results_context.set([])
     rag_results_context.set([])
 
+    light_answer = _classify_light_interaction(message)
+    if light_answer:
+        history = get_session_history(effective_session)
+        history.add_user_message(message)
+        history.add_ai_message(light_answer)
+
+        light_result = {
+            "final_answer": light_answer,
+            "analysis_type": "saudacao",
+            "periodo": {"inicio": None, "fim_exclusivo": None},
+            "unit_of_analysis": "nao_aplicavel",
+            "error": False,
+            "errorType": None,
+            "errorMessage": None,
+            "rag_used": False,
+            "sql_used": False,
+            "user_asked_for_sql": False,
+            "judge_passed": True,
+            "judge_score": 1.0,
+            "job_id": job_id,
+            "sessionId": effective_session,
+            "conversationId": effective_conversation,
+            "originalInput": message,
+            "validated": True,
+            "has_data": False,
+            "executor_row_count": 0,
+            "executor_summary": {},
+            "query_result": None,
+            "final_delivery_policy": "delivered_without_blocking",
+            "fast_path": "light_interaction",
+        }
+        asyncio.create_task(_post_execution(
+            job_id, effective_session, effective_conversation,
+            message, light_result, [], []
+        ))
+
+        yield light_answer
+        return
+
     query_plan = {
-        "routing": "sql_specialist_decides",
+        "routing": "agent_decides_tools",
         "output_mode": None,
         "sample_size": 5,
     }
 
     memory_context = load_curated_lessons()
-
     history = get_session_history(effective_session)
     recent_messages = list(history.messages)[-8:]
     rag_context = ""
     loop = asyncio.get_event_loop()
-    try:
-        rag_context, captured_rag = await loop.run_in_executor(None, _run_clinical_rag_in_thread, message)
-        rag_results_context.set(captured_rag)
-        logger.info("RAG Expert concluído.")
-    except Exception as e:
-        logger.error(f"RAG Expert falhou: {e}")
+    should_use_rag = _needs_rag_context(message)
+    should_use_sql = _needs_data_query(message)
+
+    query_plan.update({
+        "rag_policy": "on_demand",
+        "sql_policy": "on_demand",
+        "rag_requested": should_use_rag,
+        "sql_requested": should_use_sql,
+    })
+
+    if should_use_rag:
+        try:
+            rag_context, captured_rag = await loop.run_in_executor(None, _run_clinical_rag_in_thread, message)
+            rag_results_context.set(captured_rag)
+            logger.info("RAG Expert concluido sob demanda.")
+        except Exception as e:
+            logger.error(f"RAG Expert falhou: {e}")
+    else:
+        logger.info("RAG Expert ignorado: pergunta nao exige contexto clinico.")
 
     rag_used = bool(rag_context)
 
-    # ── 6. SQL Query Analyst & Executor Agent ─────────────────────────────────
     sql_result = {}
     sql_used = False
-    try:
-        sql_result, captured_athena = await loop.run_in_executor(
-            None,
-            _run_sql_analyst_in_thread,
-            message,
-            rag_context,
-            None,
-            query_plan["sample_size"],
-            hoje,
-            0
-        )
-        athena_results_context.set(captured_athena)
-        sql_used = sql_result.get("execution_status") != "error"
-        logger.info(f"SQL Analyst concluído | status={sql_result.get('execution_status')} | row_count={sql_result.get('row_count', 0)}")
-    except Exception as e:
-        logger.error(f"SQL Analyst falhou: {e}")
-        sql_result = {"execution_status": "error", "error": {"message": str(e)}, "rows": [], "summary": {}, "row_count": 0}
+    if should_use_sql:
+        try:
+            sql_result, captured_athena = await loop.run_in_executor(
+                None,
+                _run_sql_analyst_in_thread,
+                message,
+                rag_context,
+                None,
+                query_plan["sample_size"],
+                hoje,
+                0
+            )
+            athena_results_context.set(captured_athena)
+            sql_used = sql_result.get("execution_status") != "error"
+            logger.info(f"SQL Analyst concluido sob demanda | status={sql_result.get('execution_status')} | row_count={sql_result.get('row_count', 0)}")
+        except Exception as e:
+            logger.error(f"SQL Analyst falhou: {e}")
+            sql_result = {"execution_status": "error", "error": {"message": str(e)}, "rows": [], "summary": {}, "row_count": 0}
+    else:
+        logger.info("SQL Analyst ignorado: pergunta nao exige consulta de dados.")
 
     query_plan.update({
         "query_shape": sql_result.get("query_shape"),
@@ -326,6 +501,7 @@ async def run_iris_agent(
 # Post-Execution: Auto-Learning + Logging (background)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@traceable(name="iris_post_execution", as_type="span")
 async def _post_execution(
     job_id: str,
     session_id: str,
@@ -373,3 +549,5 @@ async def _post_execution(
         )
     except Exception as e:
         logger.error(f"Erro no post-execution da Iris: {e}")
+    finally:
+        flush_langfuse()

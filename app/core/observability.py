@@ -19,8 +19,10 @@ def _configure_langfuse_env() -> None:
 _configure_langfuse_env()
 
 try:
+    from langfuse import get_client as _langfuse_get_client
     from langfuse import observe as _langfuse_observe
 except Exception:
+    _langfuse_get_client = None
     _langfuse_observe = None
 
 
@@ -35,6 +37,16 @@ def get_langfuse_callbacks() -> list[Any]:
         return []
 
     return [CallbackHandler()]
+
+
+def flush_langfuse() -> None:
+    if _langfuse_get_client is None:
+        return
+
+    try:
+        _langfuse_get_client().flush()
+    except Exception:
+        return
 
 
 def traceable(func: Callable | None = None, *, name: str | None = None, as_type: str | None = None, **kwargs: Any):

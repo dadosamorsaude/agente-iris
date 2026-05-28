@@ -20,6 +20,7 @@ import unicodedata
 from datetime import datetime, timedelta, date
 from typing import Any, Optional
 
+from app.core.observability import get_langfuse_callbacks, traceable
 from app.tools.athena import _execute_athena_query, validate_sql, athena_results_context
 from app.services.llm import get_chat_model_openai
 
@@ -82,21 +83,6 @@ Regras SQL Athena/Presto:
 - Quando precisar limitar linhas detalhadas, prefira row_number() em CTE
   e filtre rn <= N no SELECT final.
 """
-
-
-AGGREGATION_REGEXES = [
-    r"\bcount\s*\(",
-    r"\bsum\s*\(",
-    r"\bavg\s*\(",
-    r"\bmin\s*\(",
-    r"\bmax\s*\(",
-    r"\bgroup\s+by\b",
-    r"\bhaving\b",
-]
-
-
-DETAIL_QUERY_SHAPES = {"detail", "sample", "lookup"}
-AGGREGATE_QUERY_SHAPES = {"aggregate", "breakdown", "timeline", "mixed"}
 
 
 def _normalize_text_intent(text: str) -> str:
@@ -378,183 +364,21 @@ def _resolve_query_shape(
     output_mode: Optional[str] = None,
     sample_size: int = 5,
 ) -> dict:
-    """
-    Decide automaticamente o tipo de consulta esperado.
+    """Resolve apenas a preferencia inicial da consulta.
 
-    query_shape:
-    - aggregate: total, quantidade, percentual, soma geral
-    - detail: linhas individuais, pacientes, atendimentos, casos
-    - sample: amostra integral, exemplos
-    - lookup: busca específica por paciente, atendimento, profissional ou valor
-    - breakdown: agrupamento por clínica, regional, médico, UF etc.
-    - timeline: evolução no tempo, mês a mês, dia a dia
-    - mixed: resumo + detalhes
-    - distinct: lista de valores distintos
+    O SQL fica livre para adaptar a consulta a pergunta do usuario. Esta funcao
+    evita o antigo roteamento grande e deixa so tres modos: detail, aggregate
+    e mixed. Na duvida, detail preserva dados brutos.
     """
     text = _normalize_text_intent(query)
     explicit_mode = _normalize_text_intent(output_mode or "")
-    requested_limit = _detect_requested_limit(text, sample_size)
 
-    aggregate_terms = [
-        "quantos",
-        "quantas",
-        "total",
-        "totais",
-        "percentual",
-        "porcentagem",
-        "proporcao",
-        "proporção",
-        "taxa",
-        "media",
-        "média",
-        "mediana",
-        "contagem",
-        "distribuicao",
-        "distribuição",
-        "volume",
-        "indicador",
-        "indicadores",
-    ]
-
-    detail_terms = [
-        "liste",
-        "listar",
-        "lista",
-        "mostre",
-        "mostrar",
-        "traga",
-        "retorne",
-        "quais pacientes",
-        "quais atendimentos",
-        "casos",
-        "registros",
-        "linhas",
-        "pacientes com",
-        "atendimentos com",
-        "evidencias",
-        "evidências",
-        "detalhe",
-        "detalhes",
-        "prontuarios",
-        "prontuários",
-    ]
-
-    sample_terms = [
-        "amostra",
-        "amostras",
-        "exemplo",
-        "exemplos",
-        "alguns casos",
-        "algumas linhas",
-        "linhas de exemplo",
-        "amostra integral",
-    ]
-
-    timeline_terms = [
-        "mes a mes",
-        "mês a mês",
-        "por mes",
-        "por mês",
-        "mensal",
-        "dia a dia",
-        "por dia",
-        "diario",
-        "diário",
-        "semanal",
-        "por semana",
-        "evolucao",
-        "evolução",
-        "ao longo do tempo",
-        "serie temporal",
-        "série temporal",
-        "tendencia",
-        "tendência",
-    ]
-
-    breakdown_terms = [
-        "por clinica",
-        "por clínica",
-        "por regional",
-        "por uf",
-        "por municipio",
-        "por município",
-        "por profissional",
-        "por medico",
-        "por médico",
-        "por especialidade",
-        "agrupado",
-        "agrupada",
-        "agrupamento",
-        "ranking",
-        "rank",
-        "top",
-    ]
-
-    lookup_terms = [
-        "id_paciente",
-        "id atendimento",
-        "id_atendimento",
-        "id profissional",
-        "id_profissional",
-        "paciente especifico",
-        "paciente específico",
-        "atendimento especifico",
-        "atendimento específico",
-    ]
-
-    distinct_terms = [
-        "quais valores",
-        "valores distintos",
-        "valores unicos",
-        "valores únicos",
-        "distinct",
-        "sem repetir",
-        "unicos",
-        "únicos",
-        "quais clinicas",
-        "quais clínicas",
-        "quais regionais",
-        "quais profissionais",
-        "quais municipios",
-        "quais municípios",
-    ]
-
-    has_aggregate = any(term in text for term in aggregate_terms)
-    has_detail = any(term in text for term in detail_terms)
-    has_sample = any(term in text for term in sample_terms)
-    has_timeline = any(term in text for term in timeline_terms)
-    has_breakdown = any(term in text for term in breakdown_terms)
-    has_lookup = any(term in text for term in lookup_terms)
-    has_distinct = any(term in text for term in distinct_terms)
-
-    asks_summary_and_details = any(
-        term in text
-        for term in [
-            "resumo e detalhe",
-            "resumo e detalhes",
-            "resumo com detalhes",
-            "resumo com exemplos",
-            "total e exemplos",
-            "quantidade e exemplos",
-            "contagem e exemplos",
-            "com exemplos",
-        ]
-    )
-
-    if explicit_mode in {"sample", "amostra"}:
-        return {
-            "query_shape": "sample",
-            "output_mode": "sample",
-            "limit": requested_limit,
-            "reason": "output_mode explícito como sample.",
-        }
-
-    if explicit_mode in {"detail", "detalhe", "detalhado"}:
+    if explicit_mode in {"detail", "detalhe", "detalhado", "sample", "amostra", "lookup"}:
         return {
             "query_shape": "detail",
             "output_mode": "detail",
             "limit": _detect_requested_limit(text, 20),
-            "reason": "output_mode explícito como detail.",
+            "reason": "Modo detalhado solicitado explicitamente.",
         }
 
     if explicit_mode in {"summary", "aggregate", "agregado", "resumo"}:
@@ -562,7 +386,7 @@ def _resolve_query_shape(
             "query_shape": "aggregate",
             "output_mode": "summary",
             "limit": 0,
-            "reason": "output_mode explícito como summary.",
+            "reason": "Modo agregado solicitado explicitamente.",
         }
 
     if explicit_mode in {"mixed", "resumo_linhas", "summary_rows"}:
@@ -570,278 +394,86 @@ def _resolve_query_shape(
             "query_shape": "mixed",
             "output_mode": "mixed",
             "limit": _detect_requested_limit(text, 20),
-            "reason": "output_mode explícito como mixed.",
+            "reason": "Modo misto solicitado explicitamente.",
         }
 
-    if has_sample:
-        return {
-            "query_shape": "sample",
-            "output_mode": "sample",
-            "limit": requested_limit,
-            "reason": "Usuário pediu amostra/exemplos.",
-        }
+    wants_detail = re.search(
+        r"\b(liste|listar|lista|mostre|mostrar|traga|retorne|casos|registros|linhas|"
+        r"pacientes|atendimentos|evidencias|detalhes|prontuarios|amostra|exemplos?)\b",
+        text,
+    )
+    wants_aggregate = re.search(
+        r"\b(quantos|quantas|total|percentual|porcentagem|proporcao|taxa|media|"
+        r"contagem|distribuicao|volume|indicador|ranking|evolucao|por clinica|"
+        r"por regional|por uf|por municipio|por profissional|por medico|por mes|mensal)\b",
+        text,
+    )
 
-    if has_timeline:
-        return {
-            "query_shape": "timeline",
-            "output_mode": "rows",
-            "limit": 200,
-            "reason": "Usuário pediu evolução temporal.",
-        }
-
-    if has_breakdown:
-        return {
-            "query_shape": "breakdown",
-            "output_mode": "rows",
-            "limit": 200,
-            "reason": "Usuário pediu agrupamento/ranking.",
-        }
-
-    if asks_summary_and_details or (has_aggregate and has_detail):
+    if wants_detail and wants_aggregate:
         return {
             "query_shape": "mixed",
             "output_mode": "mixed",
             "limit": _detect_requested_limit(text, 20),
-            "reason": "Usuário pediu resumo e detalhes.",
+            "reason": "Pedido combina metrica e dados brutos.",
         }
 
-    if has_lookup or re.search(r"\b\d{5,}\b", text):
-        return {
-            "query_shape": "lookup",
-            "output_mode": "detail",
-            "limit": _detect_requested_limit(text, 20),
-            "reason": "Usuário parece buscar um registro específico.",
-        }
-
-    if has_distinct:
-        return {
-            "query_shape": "distinct",
-            "output_mode": "rows",
-            "limit": 200,
-            "reason": "Usuário pediu lista de valores distintos.",
-        }
-
-    if has_detail:
+    if wants_detail or re.search(r"\b\d{5,}\b", text):
         return {
             "query_shape": "detail",
             "output_mode": "detail",
             "limit": _detect_requested_limit(text, 20),
-            "reason": "Usuário pediu registros individuais.",
+            "reason": "Pedido pede ou sugere registros individuais.",
         }
 
-    if has_aggregate:
+    if wants_aggregate:
         return {
             "query_shape": "aggregate",
             "output_mode": "summary",
             "limit": 0,
-            "reason": "Usuário pediu métrica agregada.",
+            "reason": "Pedido pede metrica, agrupamento ou evolucao.",
         }
 
-    # Fallback deliberado:
-    # Se a pergunta não pede explicitamente total/percentual/agregação,
-    # preferimos detalhe para evitar o comportamento antigo de agregar tudo.
     return {
         "query_shape": "detail",
         "output_mode": "detail",
         "limit": _detect_requested_limit(text, 20),
-        "reason": "Fallback: sem pedido explícito de agregação, retornar detalhes.",
+        "reason": "Fallback simples: preservar dados brutos.",
     }
 
 
 def _build_query_shape_contract(query_shape: str, output_mode: str, sample_size: int, detail_limit: int) -> str:
-    if query_shape == "aggregate":
-        return """
-Tipo de consulta inferido: aggregate
-
-Use quando o usuário pedir total, quantidade, percentual, proporção, contagem ou indicador geral.
-
-Regras:
-- Retorne apenas métricas agregadas no SELECT final.
-- Não liste pacientes ou atendimentos individuais.
-- Métricas recomendadas:
-  - total_registros
-  - total_pacientes_unicos
-  - positivos
-  - provaveis
-  - negativos
-  - pos_operatorios
-  - percentual_positivos
-  - percentual_provaveis
-  - percentual_negativos
-"""
-
-    if query_shape == "detail":
-        return f"""
-Tipo de consulta inferido: detail
-
-Use quando o usuário pedir lista, casos, registros, pacientes, atendimentos, prontuários ou evidências individuais.
-
-Regras obrigatórias:
-- NÃO use COUNT, SUM, AVG, MIN, MAX, GROUP BY ou HAVING no SELECT final.
-- NÃO transforme listagem em contagem.
-- Retorne linhas individuais.
-- Inclua, sempre que possível:
-  - id_atendimento
-  - id_paciente
-  - nome_paciente
-  - data_atendimento
-  - classificacao
-  - score
-  - campo_origem
-  - termo_detectado
-  - trecho_evidencia
-  - cid_codigo_txt
-  - flg_cirurgica
-  - clinica
-  - regional
-  - uf
-  - municipio
-  - nome_profissional
-- Se precisar limitar, use row_number() em CTE chamada amostra/detalhes
-  e filtre rn <= {detail_limit}.
-"""
-
-    if query_shape == "sample":
-        return f"""
-Tipo de consulta inferido: sample
-
-Use quando o usuário pedir amostra, exemplos ou algumas linhas.
-
-Regras obrigatórias:
-- Ignore agregações.
-- NÃO use COUNT, SUM, AVG, MIN, MAX, GROUP BY ou HAVING.
-- Retorne apenas linhas individuais de amostra.
-- A amostra deve ser integral, isto é, com colunas úteis do registro,
-  evidência clínica e identificação do atendimento/paciente.
-- Para limitar a amostra, use row_number() em uma CTE chamada amostra
-  e filtre rn <= {sample_size}.
-- Não use LIMIT.
-"""
-
-    if query_shape == "lookup":
-        return f"""
-Tipo de consulta inferido: lookup
-
-Use quando o usuário buscar um paciente, atendimento, profissional ou registro específico.
-
-Regras obrigatórias:
-- NÃO use agregações.
-- NÃO use COUNT, SUM, AVG, MIN, MAX, GROUP BY ou HAVING.
-- Retorne registros individuais compatíveis com os critérios da pergunta.
-- Inclua evidências clínicas e campos de identificação.
-- Se precisar limitar, use row_number() e filtre rn <= {detail_limit}.
-"""
-
-    if query_shape == "breakdown":
-        return """
-Tipo de consulta inferido: breakdown
-
-Use quando o usuário pedir agrupamento por clínica, regional, UF, município,
-profissional, especialidade, classificação ou outro recorte.
-
-Regras:
-- Use GROUP BY somente nas dimensões pedidas ou claramente necessárias.
-- Retorne uma linha por grupo.
-- Métricas recomendadas:
-  - total_registros
-  - total_pacientes_unicos
-  - positivos
-  - provaveis
-  - negativos
-  - pos_operatorios
-  - percentual_positivos
-  - percentual_provaveis
-  - percentual_negativos
-- Não liste pacientes individuais, exceto se o usuário também pedir detalhes.
-"""
-
-    if query_shape == "timeline":
-        return """
-Tipo de consulta inferido: timeline
-
-Use quando o usuário pedir evolução temporal, mês a mês, dia a dia,
-semana a semana ou tendência.
-
-Regras:
-- Use date_trunc conforme a granularidade pedida:
-  - mensal: date_trunc('month', data_atendimento)
-  - semanal: date_trunc('week', data_atendimento)
-  - diária: data_atendimento
-- Retorne uma linha por período.
-- Inclua métricas de volume e classificação.
-- Ordene cronologicamente.
-"""
-
-    if query_shape == "mixed":
-        return f"""
-Tipo de consulta inferido: mixed
-
-Use quando o usuário pedir resumo + detalhes, total + exemplos ou contagem + casos.
-
-Regras:
-- Separe agregações e linhas detalhadas em CTEs diferentes.
-- CTE recomendada:
-  base -> texto_normalizado -> features -> score_calc -> classificado -> resumo -> detalhes
-- No SELECT final, pode usar CROSS JOIN entre resumo e detalhes.
-- Limite as linhas detalhadas com row_number() e filtre rn <= {detail_limit}.
-"""
-
-    if query_shape == "distinct":
-        return """
-Tipo de consulta inferido: distinct
-
-Use quando o usuário pedir quais valores existem, valores únicos,
-clínicas, regionais, profissionais ou categorias sem repetir.
-
-Regras:
-- Use SELECT DISTINCT quando o usuário pedir apenas a lista.
-- Só use COUNT/GROUP BY se o usuário pedir quantidade por valor.
-- Retorne a coluna solicitada de forma limpa, sem registros duplicados.
-"""
-
     return f"""
-Tipo de consulta inferido: {query_shape}
-Siga a intenção da pergunta do usuário.
+Preferencia inicial de consulta: {query_shape}
+Modo de saida preferido: {output_mode}
+Limite preferido para linhas detalhadas: {detail_limit}
+
+Use a pergunta do usuario como fonte principal de decisao. Voce pode retornar:
+- aggregate: metricas, totais, percentuais, rankings, recortes ou series temporais.
+- detail: registros brutos/individuais, amostras integrais, pacientes, atendimentos, evidencias.
+- mixed: metricas e registros brutos juntos quando isso responder melhor ao pedido.
+
+Regras de liberdade controlada:
+- Se o usuario pedir dados brutos, registros, casos, pacientes, atendimentos, amostra ou evidencias, preserve linhas individuais.
+- Para registros individuais, inclua o maximo de campos uteis do prontuario: ids, data, paciente, profissional, clinica, textos clinicos, CID, assinatura, exame, prescricao, orientacao, conduta e evidencias.
+- Para metricas, use agregacoes livremente, mas mantenha nomes de colunas claros.
+- Para respostas mistas, separe resumo e detalhes em CTEs e retorne ambos no resultado final.
+- Se precisar limitar registros brutos, prefira row_number() em CTE e filtre rn <= {detail_limit}.
+- Nao use LIMIT.
 """
-
-
-def _sql_has_aggregation(sql: str) -> bool:
-    sql_lower = _normalize_text_intent(sql)
-
-    for pattern in AGGREGATION_REGEXES:
-        if re.search(pattern, sql_lower, flags=re.IGNORECASE):
-            return True
-
-    return False
 
 
 def _semantic_validate_sql(sql: str, query_shape: str, original_query: str) -> None:
-    """
-    Validação semântica simples para evitar que pedidos de linha/amostra
-    sejam respondidos com SQL agregado.
-    """
+    """Mantem apenas validacoes que evitam erro real ou risco amplo."""
     sql_lower = _normalize_text_intent(sql)
 
     if not sql_lower:
         raise ValueError("SQL vazio gerado pelo LLM.")
 
     if re.search(r"\bselect\s+\*", sql_lower):
-        raise ValueError("SQL inválido semanticamente: SELECT * não é permitido.")
-
-    if query_shape in DETAIL_QUERY_SHAPES and _sql_has_aggregation(sql):
-        raise ValueError(
-            "A pergunta pede registros individuais/amostra/busca específica, "
-            "mas o SQL gerado contém agregação. Regenere sem COUNT, SUM, AVG, "
-            "MIN, MAX, GROUP BY ou HAVING."
-        )
-
-    if query_shape in DETAIL_QUERY_SHAPES and "id_atendimento" not in sql_lower:
-        logger.warning(
-            "SQL detalhado sem id_atendimento detectado. Não bloqueado, mas pode reduzir rastreabilidade."
-        )
+        raise ValueError("SQL invalido semanticamente: SELECT * nao e permitido.")
 
     if "id_especialidade = 661" not in sql_lower and "id_especialidade=661" not in sql_lower:
-        raise ValueError("SQL inválido semanticamente: filtro obrigatório id_especialidade = 661 ausente.")
+        raise ValueError("SQL invalido semanticamente: filtro obrigatorio id_especialidade = 661 ausente.")
 
 
 def _generate_sql(
@@ -878,19 +510,18 @@ def _generate_sql(
 Gere UMA ÚNICA consulta SQL Athena limpa, adaptada à intenção real da pergunta do usuário.
 
 REGRA MAIS IMPORTANTE:
-- Use agregações SOMENTE quando o usuário pedir total, quantidade, percentual,
-  proporção, distribuição, agrupamento, ranking ou evolução temporal.
-- Se o usuário pedir lista, casos, pacientes, atendimentos, exemplos, amostra
-  ou evidências individuais, retorne linhas detalhadas, SEM agregações.
-- Nunca transforme pedido de listagem/amostra em contagem agregada.
+- Decida livremente a melhor consulta para responder ao usuario.
+- Use agregacoes quando elas ajudarem.
+- Preserve registros brutos quando o usuario pedir casos, amostras, pacientes, atendimentos, prontuarios ou evidencias.
+- Consultas mistas sao permitidas: resumo + linhas individuais.
 
 {CATARATA_SCHEMA}
 
 Contrato de Execução:
 1. Tabela: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
 2. Filtro fixo obrigatório: id_especialidade = 661{period_filter}
-4. output_mode resolvido: '{output_mode}'
-5. query_shape resolvido: '{query_shape}'
+4. output_mode preferido: '{output_mode}'
+5. query_shape preferido: '{query_shape}'
 
 {query_shape_contract}
 
@@ -921,7 +552,8 @@ Regras Cruciais:
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
-        ]
+        ],
+        config={"callbacks": get_langfuse_callbacks()},
     )
 
     return _strip_markdown_sql(response.content)
@@ -947,8 +579,7 @@ Erro:
 SQL anterior:
 {original_sql}
 
-Regenere a consulta do zero respeitando o query_shape '{query_shape}'.
-Se query_shape for detail, sample ou lookup, NÃO use agregações.
+Regenere a consulta do zero. O query_shape '{query_shape}' e apenas uma preferencia; responda a pergunta do usuario com a forma de dados mais util.
 """
 
     return _generate_sql(
@@ -1013,115 +644,51 @@ def _format_sql_result(
     query_shape: str = "detail",
     detail_limit: int = 20,
 ) -> dict:
-    """
-    Formata e estrutura os resultados brutos do Athena em payload padronizado.
-
-    Diferença importante:
-    - summary/aggregate: retorna resumo agregado.
-    - detail/sample/lookup: retorna linhas individuais, sem summary artificial.
-    - breakdown/timeline/distinct: retorna linhas agrupadas ou distintas como rows.
-    - mixed: retorna summary + linhas individuais.
-    """
+    """Formata o retorno preservando dados brutos sempre que existirem."""
     if not results:
         return {
             "execution_status": "success",
             "summary": {},
             "rows": [],
+            "raw_rows": [],
             "row_count": 0,
+            "total_rows_returned_by_athena": 0,
             "truncated": False,
             "error": None,
-            "limitations": ["Nenhum registro encontrado para os critérios informados."],
+            "limitations": ["Nenhum registro encontrado para os criterios informados."],
         }
 
-    first = results[0]
-
-    if query_shape == "aggregate" or output_mode == "summary":
-        return {
-            "execution_status": "success",
-            "summary": _extract_summary(first, len(results)),
-            "rows": [],
-            "row_count": len(results),
-            "truncated": False,
-            "error": None,
-            "limitations": [],
-        }
-
-    if query_shape in {"detail", "lookup"}:
+    max_rows = detail_limit if detail_limit > 0 else 200
+    if query_shape == "aggregate" and output_mode == "summary":
+        max_rows = max(len(results), 200)
+    elif query_shape == "detail":
         max_rows = detail_limit
-        truncated = len(results) > max_rows
-        rows_to_return = results[:max_rows]
-
-        return {
-            "execution_status": "success",
-            "summary": {},
-            "rows": [_compact_detail_row(row) for row in rows_to_return],
-            "row_count": len(rows_to_return),
-            "total_rows_returned_by_athena": len(results),
-            "truncated": truncated,
-            "error": None,
-            "limitations": ["Resultados truncados."] if truncated else [],
-        }
-
-    if query_shape == "sample" or output_mode == "sample":
-        max_rows = sample_size
-        truncated = len(results) > max_rows
-        rows_to_return = results[:max_rows]
-
-        return {
-            "execution_status": "success",
-            "summary": {},
-            "rows": [_compact_detail_row(row) for row in rows_to_return],
-            "row_count": len(rows_to_return),
-            "total_rows_returned_by_athena": len(results),
-            "truncated": truncated,
-            "error": None,
-            "limitations": ["Amostra truncada."] if truncated else [],
-        }
-
-    if query_shape == "mixed":
+    elif query_shape == "mixed":
         max_rows = detail_limit
-        truncated = len(results) > max_rows
-        rows_to_return = results[:max_rows]
 
-        return {
-            "execution_status": "success",
-            "summary": _extract_summary(first, len(results)),
-            "rows": [_compact_detail_row(row) for row in rows_to_return],
-            "row_count": len(rows_to_return),
-            "total_rows_returned_by_athena": len(results),
-            "truncated": truncated,
-            "error": None,
-            "limitations": ["Resultados detalhados truncados."] if truncated else [],
-        }
+    rows_to_return = results[:max_rows]
+    truncated = len(results) > len(rows_to_return)
+    safe_rows = [_make_json_safe(row) for row in rows_to_return]
 
-    if query_shape in {"breakdown", "timeline", "distinct"}:
-        max_rows = detail_limit if detail_limit > 0 else 200
-        truncated = len(results) > max_rows
-        rows_to_return = results[:max_rows]
-
-        return {
-            "execution_status": "success",
-            "summary": {},
-            "rows": [_make_json_safe(row) for row in rows_to_return],
-            "row_count": len(rows_to_return),
-            "total_rows_returned_by_athena": len(results),
-            "truncated": truncated,
-            "error": None,
-            "limitations": ["Resultados truncados."] if truncated else [],
-        }
-
-    # Fallback seguro: preserva os dados retornados.
-    return {
+    payload = {
         "execution_status": "success",
         "summary": {},
-        "rows": [_make_json_safe(row) for row in results],
-        "row_count": len(results),
-        "truncated": False,
+        "rows": safe_rows,
+        "raw_rows": safe_rows,
+        "row_count": len(rows_to_return),
+        "total_rows_returned_by_athena": len(results),
+        "truncated": truncated,
         "error": None,
-        "limitations": [],
+        "limitations": ["Resultados truncados."] if truncated else [],
     }
 
+    if query_shape in {"aggregate", "mixed"} or output_mode in {"summary", "mixed"}:
+        payload["summary"] = _extract_summary(results[0], len(results))
 
+    return payload
+
+
+@traceable(name="sql_analyst_expert", as_type="span")
 def sql_analyst_expert(
     query: str,
     rag_context: str,
@@ -1154,9 +721,6 @@ def sql_analyst_expert(
     query_shape = intent["query_shape"]
     resolved_output_mode = intent["output_mode"]
     detail_limit = intent["limit"] or 20
-
-    if query_shape == "sample":
-        sample_size = intent["limit"] or sample_size
 
     logger.info(
         "SQL Analyst Expert iniciado | "
@@ -1303,15 +867,17 @@ Erro:
 Corrija o SQL para ser compatível com Presto/Athena e respeitar o schema:
 pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
 
-Regras obrigatórias:
+Regras obrigatorias:
 - Sempre manter id_especialidade = 661.
 - Nunca usar SELECT *.
-- Se query_shape for detail, sample ou lookup, NÃO use COUNT, SUM, AVG, MIN, MAX,
-  GROUP BY ou HAVING.
-- Retorne APENAS o SQL corrigido, sem markdown e sem explicações.
+- Preserve dados brutos quando a pergunta pedir registros individuais.
+- Retorne APENAS o SQL corrigido, sem markdown e sem explicacoes.
 """
 
-                fix_response = llm.invoke([{"role": "user", "content": fix_prompt}])
+                fix_response = llm.invoke(
+                    [{"role": "user", "content": fix_prompt}],
+                    config={"callbacks": get_langfuse_callbacks()},
+                )
                 fixed_sql = _strip_markdown_sql(fix_response.content)
 
                 _semantic_validate_sql(fixed_sql, query_shape, query)
