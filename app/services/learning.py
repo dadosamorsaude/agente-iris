@@ -5,6 +5,7 @@ import logging
 import httpx
 
 from app.core.config import settings
+from app.services.intent import detect_intent
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +113,11 @@ def generate_lessons_from_execution(execution_data: dict) -> list[dict]:
     low_score = judge_score is not None and float(judge_score) < 0.75
     judge_failed = (judge_passed is False) or low_score
 
-    # Intent flags
-    sample_terms = ['amostra', 'amostras', 'exemplo', 'exemplos', 'casos exemplo', 'algumas linhas', 'linhas de exemplo', 'registros de exemplo']
-    is_sample_intent = any(term in input_text for term in sample_terms) or "amostra" in analysis_type
-    
-    evidence_terms = ['evidencia', 'evidencias', 'evidência', 'evidências', 'trecho', 'trechos', 'justificativa', 'justificativas', 'motivo', 'motivos', 'termo detectado', 'campo de origem']
-    is_evidence_intent = any(term in input_text for term in evidence_terms)
-    
-    aggregation_terms = ['quantos', 'quantas', 'quantidade', 'contagem', 'total', 'percentual', 'porcentagem', 'distribuicao', 'distribuição', 'media', 'média', 'resumo', 'relatorio', 'relatório']
-    is_aggregation_intent = any(term in input_text for term in aggregation_terms)
+    # Intent flags via serviço centralizado
+    _detected = detect_intent(original_input)
+    is_sample_intent = _detected["sample_mode"] or "amostra" in analysis_type
+    is_evidence_intent = _detected["wants_rows"] and not _detected["sample_mode"]
+    is_aggregation_intent = _detected["has_aggregation_intent"]
 
     # 1. Erro genérico recorrente
     if execution_data.get("error") is True and execution_data.get("errorType"):

@@ -1,8 +1,7 @@
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
-from app.core.observability import get_langfuse_callbacks, traceable
+from app.core.observability import get_langsmith_callbacks, traceable
 from app.tools.rag import get_retriever, rag_results_context, format_docs
 from app.services.llm import get_chat_model_openai
 
@@ -10,14 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 @traceable(name="clinical_rag_expert", as_type="span")
-def clinical_rag_expert(query: str) -> str:
-    """
-    Especialista clínico em RAG Catarata.
-    Consulta o index 'rag-agente-cirurgias' em dois namespaces em paralelo:
-    1. 'treinamento_ia_catarata' (Regras, scoring, output esperado - PRIORITÁRIO)
-    2. 'catarata_vocabulario_expandido' (Termos, siglas, CIDs - COMPLEMENTAR)
-    Retorna o rag_context estruturado como JSON textual para o orquestrador.
-    """
+async def clinical_rag_expert(query: str) -> str:
     logger.info(f"Clinical RAG Expert consultando RAG Catarata para query: '{query}'")
 
     retriever_treinamento = get_retriever("rag-agente-cirurgias", "treinamento_ia_catarata", k=4)
@@ -27,14 +19,9 @@ def clinical_rag_expert(query: str) -> str:
         logger.warning("Pinecone não configurado. RAG Expert indisponível.")
         return "Nenhuma diretriz de catarata disponível no momento."
 
-    # Paraleliza as duas chamadas ao Pinecone para reduzir latência
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f_treinamento = executor.submit(retriever_treinamento.invoke, query)
-        f_vocabulario = executor.submit(retriever_vocabulario.invoke, query)
-        docs_treinamento = f_treinamento.result()
-        docs_vocabulario = f_vocabulario.result()
+    docs_treinamento = await retriever_treinamento.ainvoke(query)
+    docs_vocabulario = await retriever_vocabulario.ainvoke(query)
 
-    # Salva no contextvar para auditoria posterior pelo Judge
     captured = rag_results_context.get([])
     rag_results_context.set(
         captured + [
@@ -126,11 +113,12 @@ def clinical_rag_expert(query: str) -> str:
     )
 
     try:
-        response = llm.invoke(
+        response = await llm.ainvoke(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            config={"callbacks": get_langsmith_callbacks()},
         )
         rag_context = response.content.strip()
         logger.info("Clinical RAG Expert consolidou com sucesso o JSON estruturado do RAG.")

@@ -9,20 +9,11 @@ implementa o fluxo de raciocínio profundo (Multi-Agent Deep Architecture):
   4. Iris Synthesizer (LLM)
   5. Quality Judge como metrica assincrona
   6. Self-Learning & Persistent Logger
-
-MELHORIAS:
-- load_curated_lessons + RAG são executados em paralelo (asyncio.gather)
-- Callbacks Langfuse passados apenas no construtor, não duplicados no ainvoke
-- Streaming SSE real com tokens enviados ao cliente imediatamente
-- detect_intent() de services/intent.py integrado (elimina lógica duplicada)
-- extract_text_from_content() robusto para conteúdo multi-modal
-- Tratamento de asyncio.CancelledError no streaming
 """
 
 import asyncio
 import json
 import logging
-import re
 import uuid
 from datetime import date
 from typing import Any, AsyncGenerator
@@ -31,14 +22,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
-from app.core.observability import flush_langfuse, get_langfuse_callbacks, traceable
+from app.core.observability import flush_langsmith, get_langsmith_callbacks, traceable
 from app.services.learning import load_curated_lessons, generate_lessons_from_execution, save_learned_lessons
 from app.services.evaluation_store import save_execution_log
-from app.services.intent import detect_intent
+from app.services.intent import detect_intent, light_interaction
 from app.agent.evaluator import evaluate_response
 from app.agent.specialists.clinical_rag import clinical_rag_expert
 from app.agent.specialists.sql_analyst import sql_analyst_expert
-from app.services.memory import get_session_history
+from app.services.memory import get_session_history, add_user_message, add_ai_message
+from app.services.llm import get_chat_model_openai
 from app.tools.athena import athena_results_context
 from app.tools.rag import rag_results_context
 
@@ -49,22 +41,7 @@ logger = logging.getLogger(__name__)
 # Helpers de Texto
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _normalize_for_gate(text: str) -> str:
-    import unicodedata
-    normalized = text.lower()
-    normalized = "".join(
-        c for c in unicodedata.normalize("NFD", normalized)
-        if unicodedata.category(c) != "Mn"
-    )
-    return re.sub(r"\s+", " ", normalized).strip()
-
-
 def extract_text_from_content(content: Any) -> str:
-    """
-    Extrai apenas texto legível de conteúdo LangChain/Anthropic/OpenAI.
-    Ignora blocos tool_use, input_json_delta e outros conteúdos estruturados.
-    Trazido do projeto de referência ai-agent para robustez com múltiplos modelos.
-    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -95,42 +72,6 @@ def extract_text_from_content(content: Any) -> str:
     if content_type == "text":
         return str(getattr(content, "text", ""))
     return ""
-
-
-def _classify_light_interaction(message: str) -> str | None:
-    """Detecta interações simples (saudações, agradecimentos) sem acionar o pipeline completo."""
-    text = _normalize_for_gate(message)
-
-    greetings = {"oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "e ai", "eai", "hello", "hi", "ping"}
-    if text in greetings:
-        return "Olá, eu sou a Iris, em que posso te ajudar?"
-
-    help_terms = {"ajuda", "help", "comandos", "como funciona", "o que voce faz", "o que você faz"}
-    if text in help_terms:
-        return (
-            "Eu posso ajudar com análises de cirurgia de catarata, prontuários, "
-            "classificações, evidências, contagens e relatórios clínicos."
-        )
-
-    thanks = {"obrigado", "obrigada", "valeu", "muito obrigado", "muito obrigada"}
-    if text in thanks:
-        return "Disponha. Se precisar de uma análise, é só me enviar o pedido."
-
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Thread runners (para especialistas síncronos no executor)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _run_clinical_rag_in_thread(query: str):
-    res = clinical_rag_expert(query)
-    return res, rag_results_context.get([])
-
-
-def _run_sql_analyst_in_thread(query, rag_context, output_mode, sample_size, hoje, retry_count):
-    res = sql_analyst_expert(query, rag_context, output_mode, sample_size, hoje, retry_count)
-    return res, athena_results_context.get([])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,17 +122,7 @@ Não copie o texto dos aprendizados na resposta ao usuário.
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_llm(temperature: float = 0.0) -> ChatOpenAI:
-    return ChatOpenAI(
-        model=settings.MODEL_NAME,
-        temperature=temperature,
-        api_key=settings.OPENAI_API_KEY,
-        callbacks=get_langfuse_callbacks(),
-    )
-
-
 def _safe_json(text: str) -> dict | None:
-    """Tenta extrair JSON de uma string, removendo blocos de código markdown."""
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
@@ -217,7 +148,6 @@ def _build_synthesizer_prompt(
     memory_context: str,
     hoje: str = "",
 ) -> str:
-    """Monta o prompt completo do usuário para o Iris Synthesizer."""
     parts = [
         f"Pergunta: {user_question}",
         f"\nData de hoje: {hoje}",
@@ -255,10 +185,6 @@ async def _iris_synthesize(
     hoje: str = "",
     stream: bool = False,
 ) -> dict | AsyncGenerator:
-    """
-    Invoca o LLM sintetizador e parseia o JSON de saída.
-    Se stream=True, emite tokens em tempo real ao invés de aguardar resposta completa.
-    """
     system = IRIS_SYNTHESIZER_SYSTEM
     user_content = _build_synthesizer_prompt(
         user_question, query_plan, rag_context, sql_result,
@@ -266,13 +192,11 @@ async def _iris_synthesize(
     )
 
     messages = [SystemMessage(content=system)] + history_messages + [HumanMessage(content=user_content)]
-    llm = _get_llm()
+    llm = get_chat_model_openai()
 
     if stream:
-        # Retorna o gerador para streaming — o orquestrador lida com os chunks
         return llm.astream(messages)
 
-    # Modo não-streaming: aguarda resposta completa
     response = await llm.ainvoke(messages)
     raw = extract_text_from_content(getattr(response, "content", None)) or str(response)
     parsed = _safe_json(raw)
@@ -307,16 +231,6 @@ async def run_iris_agent(
     session_id: str | None = None,
     conversation_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """
-    Ponto de entrada principal do sistema Iris Deep Agent.
-    Orquestra todos os especialistas e retorna a resposta final.
-
-    Melhorias de latência:
-    - load_curated_lessons + RAG executam em paralelo (asyncio.gather)
-    - Chamadas HTTP ao Supabase são assíncronas
-    - Streaming SSE envia tokens em tempo real (stream=True)
-    - detect_intent() substitui lógica duplicada de roteamento
-    """
     logger.info(f"Iris Deep Agent iniciado | user_id={user_id} | stream={stream}")
 
     if not message or not message.strip():
@@ -328,19 +242,18 @@ async def run_iris_agent(
     effective_session = session_id or user_id
     effective_conversation = conversation_id or user_id
 
-    # Zera os contextos de captura para esta execução
     athena_results_context.set([])
     rag_results_context.set([])
 
-    # ── Fast-path: interações leves (saudações, agradecimentos) ──────────────
-    light_answer = _classify_light_interaction(message)
-    if light_answer:
-        history = get_session_history(effective_session)
-        history.add_user_message(message)
-        history.add_ai_message(light_answer)
+    # ── Fast-path via detect_intent (unificado) ──────────────────────────────
+    intent = detect_intent(message)
+
+    if intent.get("light_response"):
+        await add_user_message(effective_session, message)
+        await add_ai_message(effective_session, intent["light_response"])
 
         light_result = {
-            "final_answer": light_answer,
+            "final_answer": intent["light_response"],
             "analysis_type": "saudacao",
             "periodo": {"inicio": None, "fim_exclusivo": None},
             "unit_of_analysis": "nao_aplicavel",
@@ -369,11 +282,9 @@ async def run_iris_agent(
             message, light_result, [], []
         ))
 
-        yield light_answer
+        yield intent["light_response"]
         return
 
-    # ── Detecta intenção via serviço dedicado (elimina lógica duplicada) ─────
-    intent = detect_intent(message)
     should_use_rag = not intent["is_simple"]
     should_use_sql = not intent["is_simple"] and (
         intent["has_aggregation_intent"] or intent["wants_rows"] or intent["sample_mode"]
@@ -389,9 +300,7 @@ async def run_iris_agent(
         "sql_requested": should_use_sql,
     }
 
-    history = get_session_history(effective_session)
-    recent_messages = list(history.messages)[-8:]
-    loop = asyncio.get_event_loop()
+    history_messages = await get_session_history(effective_session)
 
     # ── PARALELIZAÇÃO: memory + RAG executam simultaneamente ─────────────────
     rag_context = ""
@@ -399,17 +308,12 @@ async def run_iris_agent(
 
     if should_use_rag:
         try:
-            # Executa load_curated_lessons (async) e RAG (sync→executor) em paralelo
-            memory_task = load_curated_lessons()
-            rag_executor_task = asyncio.to_thread(_run_clinical_rag_in_thread, message)
-
             memory_context, rag_result = await asyncio.gather(
-                memory_task,
-                rag_executor_task,
+                load_curated_lessons(),
+                clinical_rag_expert(message),
                 return_exceptions=True,
             )
 
-            # Trata exceções individuais do gather
             if isinstance(memory_context, Exception):
                 logger.error(f"load_curated_lessons falhou: {memory_context}")
                 memory_context = '{"tipo":"aprendizados_curados_do_projeto","uso":"Erro ao carregar.","regras_prioritarias":[]}'
@@ -419,15 +323,14 @@ async def run_iris_agent(
                 rag_context = ""
                 captured_rag = []
             else:
-                rag_context, captured_rag = rag_result
+                rag_context = rag_result
+                captured_rag = rag_results_context.get([])
                 rag_results_context.set(captured_rag)
                 logger.info("RAG Expert concluído em paralelo com memory.")
-
         except Exception as e:
             logger.error(f"Erro no gather memory+RAG: {e}")
             memory_context = '{"tipo":"aprendizados_curados_do_projeto","uso":"Erro ao carregar.","regras_prioritarias":[]}'
     else:
-        # RAG não necessário — carrega apenas memory
         try:
             memory_context = await load_curated_lessons()
         except Exception as e:
@@ -437,15 +340,14 @@ async def run_iris_agent(
 
     rag_used = bool(rag_context)
 
-    # ── SQL Analyst (depende de rag_context, roda sequencialmente) ───────────
+    # ── SQL Analyst (async direto, sem thread) ───────────────────────────────
     sql_result = {}
     sql_used = False
     captured_athena = []
 
     if should_use_sql:
         try:
-            sql_result, captured_athena = await asyncio.to_thread(
-                _run_sql_analyst_in_thread,
+            sql_result = await sql_analyst_expert(
                 message,
                 rag_context,
                 query_plan["output_mode"],
@@ -453,6 +355,7 @@ async def run_iris_agent(
                 hoje,
                 0,
             )
+            captured_athena = athena_results_context.get([])
             athena_results_context.set(captured_athena)
             sql_used = sql_result.get("execution_status") != "error"
             logger.info(
@@ -481,12 +384,11 @@ async def run_iris_agent(
     final_answer = ""
 
     if stream:
-        # Streaming real: envia tokens ao cliente à medida que o LLM responde
         full_response_parts = []
         try:
             stream_gen = await _iris_synthesize(
                 message, query_plan, rag_context, sql_result,
-                memory_context, recent_messages, hoje=hoje, stream=True
+                memory_context, history_messages, hoje=hoje, stream=True
             )
             async for chunk in stream_gen:
                 token = extract_text_from_content(getattr(chunk, "content", None))
@@ -504,7 +406,6 @@ async def run_iris_agent(
             full_response_parts = [error_msg]
 
         raw_streamed = "".join(full_response_parts)
-        # Tenta parsear o JSON da resposta completa do stream
         parsed = _safe_json(raw_streamed)
         if parsed:
             final_answer = parsed.get("final_answer", raw_streamed)
@@ -520,11 +421,10 @@ async def run_iris_agent(
             }
 
     else:
-        # Modo não-streaming: aguarda resposta completa e retorna de uma vez
         try:
             synth_result = await _iris_synthesize(
                 message, query_plan, rag_context, sql_result,
-                memory_context, recent_messages, hoje=hoje, stream=False
+                memory_context, history_messages, hoje=hoje, stream=False
             )
         except Exception as e:
             logger.exception("Iris Synthesizer falhou")
@@ -557,8 +457,8 @@ async def run_iris_agent(
         "final_delivery_policy": "delivered_without_blocking",
     })
 
-    history.add_user_message(message)
-    history.add_ai_message(final_answer)
+    await add_user_message(effective_session, message)
+    await add_ai_message(effective_session, final_answer)
 
     raw_athena = athena_results_context.get([])
     raw_rag = rag_results_context.get([])
@@ -585,9 +485,7 @@ async def _post_execution(
     raw_athena: list,
     raw_rag: list,
 ) -> None:
-    """Executa as tarefas de logging e auto-learning em background."""
     try:
-        # Judge apenas metrifica; nunca bloqueia nem altera a resposta entregue.
         if result.get("judge_output") is None and (raw_athena or raw_rag):
             evaluation = await evaluate_response(
                 user_question=original_input,
@@ -606,13 +504,11 @@ async def _post_execution(
 
         result.setdefault("final_delivery_policy", "delivered_without_blocking")
 
-        # Auto-Learning: gera e salva lições a partir das métricas coletadas.
         lessons = generate_lessons_from_execution(result)
         if lessons:
             await save_learned_lessons(lessons)
             logger.info(f"Auto-Learning: {len(lessons)} lição(ões) salva(s).")
 
-        # Logging de execução (async)
         await save_execution_log(
             job_id=job_id,
             session_id=session_id,
@@ -623,4 +519,4 @@ async def _post_execution(
     except Exception as e:
         logger.error(f"Erro no post-execution da Iris: {e}")
     finally:
-        flush_langfuse()
+        flush_langsmith()

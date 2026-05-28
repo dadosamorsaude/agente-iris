@@ -14,14 +14,16 @@ Melhorias principais:
 - Preserva os dados brutos retornados pelo Athena em modos detalhados.
 """
 
+import json
 import logging
 import re
 import unicodedata
 from datetime import datetime, timedelta, date
 from typing import Any, Optional
 
-from app.core.observability import get_langfuse_callbacks, traceable
-from app.tools.athena import _execute_athena_query, validate_sql, athena_results_context
+from app.core.observability import get_langsmith_callbacks, traceable
+from app.services.intent import normalize_text
+from app.tools.athena import query_athena_tool, validate_sql, athena_results_context
 from app.services.llm import get_chat_model_openai
 
 logger = logging.getLogger(__name__)
@@ -85,16 +87,7 @@ Regras SQL Athena/Presto:
 """
 
 
-def _normalize_text_intent(text: str) -> str:
-    if not text:
-        return ""
-
-    text = text.lower()
-    text = "".join(
-        c for c in unicodedata.normalize("NFD", text)
-        if unicodedata.category(c) != "Mn"
-    )
-    return re.sub(r"\s+", " ", text).strip()
+# normalize_text importado de app.services.intent
 
 
 def _strip_markdown_sql(sql: str) -> str:
@@ -128,7 +121,7 @@ def _make_json_safe(value: Any) -> Any:
 
 
 def _detect_requested_limit(text: str, default_limit: int) -> int:
-    normalized = _normalize_text_intent(text)
+    normalized = normalize_text(text)
 
     patterns = [
         r"\b(?:top|primeiros?|primeiras?|ultimos?|ultimas?)\s+(\d{1,3})\b",
@@ -153,7 +146,7 @@ def _extract_period(original_input: str, hoje: str) -> dict:
     Extrai o período temporal da pergunta conforme implementado no nó
     'Preparar Contrato SQL' do n8n.
     """
-    text = _normalize_text_intent(original_input)
+    text = normalize_text(original_input)
 
     try:
         today = datetime.strptime(hoje, "%Y-%m-%d")
@@ -370,8 +363,8 @@ def _resolve_query_shape(
     evita o antigo roteamento grande e deixa so tres modos: detail, aggregate
     e mixed. Na duvida, detail preserva dados brutos.
     """
-    text = _normalize_text_intent(query)
-    explicit_mode = _normalize_text_intent(output_mode or "")
+    text = normalize_text(query)
+    explicit_mode = normalize_text(output_mode or "")
 
     if explicit_mode in {"detail", "detalhe", "detalhado", "sample", "amostra", "lookup"}:
         return {
@@ -464,7 +457,7 @@ Regras de liberdade controlada:
 
 def _semantic_validate_sql(sql: str, query_shape: str, original_query: str) -> None:
     """Mantem apenas validacoes que evitam erro real ou risco amplo."""
-    sql_lower = _normalize_text_intent(sql)
+    sql_lower = normalize_text(sql)
 
     if not sql_lower:
         raise ValueError("SQL vazio gerado pelo LLM.")
@@ -476,7 +469,8 @@ def _semantic_validate_sql(sql: str, query_shape: str, original_query: str) -> N
         raise ValueError("SQL invalido semanticamente: filtro obrigatorio id_especialidade = 661 ausente.")
 
 
-def _generate_sql(
+@traceable(name="generate_sql", as_type="llm")
+async def _generate_sql(
     query: str,
     rag_context: str,
     output_mode: str,
@@ -486,10 +480,7 @@ def _generate_sql(
     detail_limit: int = 20,
     extra_instruction: str = "",
 ) -> str:
-    """
-    Usa o LLM para gerar uma query SQL válida para o Athena com base na pergunta
-    do usuário, no contrato de dados e nas regras clínicas do RAG.
-    """
+    """Usa o LLM para gerar uma query SQL válida para o Athena."""
     period = _extract_period(query, hoje)
 
     period_filter = ""
@@ -548,18 +539,19 @@ Regras Cruciais:
 
     user_message = f"Pergunta: {query}\nGere a query SQL:"
 
-    response = llm.invoke(
+    response = await llm.ainvoke(
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        config={"callbacks": get_langfuse_callbacks()},
+        config={"callbacks": get_langsmith_callbacks()},
     )
 
     return _strip_markdown_sql(response.content)
 
 
-def _repair_sql_for_semantics(
+@traceable(name="repair_sql_semantics", as_type="llm")
+async def _repair_sql_for_semantics(
     original_sql: str,
     semantic_error: str,
     query: str,
@@ -582,7 +574,7 @@ SQL anterior:
 Regenere a consulta do zero. O query_shape '{query_shape}' e apenas uma preferencia; responda a pergunta do usuario com a forma de dados mais util.
 """
 
-    return _generate_sql(
+    return await _generate_sql(
         query=query,
         rag_context=rag_context,
         output_mode=output_mode,
@@ -608,6 +600,62 @@ def _extract_summary(first: dict, fallback_total: int) -> dict:
     }
 
     return {k: _make_json_safe(v) for k, v in summary.items() if v is not None}
+
+
+@traceable(name="repair_sql_execution", as_type="llm")
+async def _repair_sql_for_execution(
+    original_sql: str,
+    error_msg: str,
+    query: str,
+    query_shape: str,
+    output_mode: str,
+    sample_size: int,
+    detail_limit: int,
+) -> str:
+    """Tenta corrigir SQL que falhou na execução do Athena."""
+    llm = get_chat_model_openai(temperature=0.0, model="gpt-4.1-mini")
+
+    shape_contract = _build_query_shape_contract(
+        query_shape=query_shape,
+        output_mode=output_mode,
+        sample_size=sample_size,
+        detail_limit=detail_limit,
+    )
+
+    fix_prompt = f"""O SQL abaixo causou erro no AWS Athena/Presto.
+
+Pergunta original:
+{query}
+
+query_shape:
+{query_shape}
+
+output_mode:
+{output_mode}
+
+Contrato do tipo de consulta:
+{shape_contract}
+
+SQL com erro:
+{original_sql}
+
+Erro:
+{error_msg}
+
+Corrija o SQL para ser compatível com Presto/Athena e respeitar o schema:
+pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
+
+Regras obrigatorias:
+- Nunca usar SELECT *.
+- Preserve dados brutos quando a pergunta pedir registros individuais.
+- Retorne APENAS o SQL corrigido, sem markdown e sem explicacoes.
+"""
+
+    fix_response = await llm.ainvoke(
+        [{"role": "user", "content": fix_prompt}],
+        config={"callbacks": get_langsmith_callbacks()},
+    )
+    return _strip_markdown_sql(fix_response.content)
 
 
 def _compact_detail_row(row: dict) -> dict:
@@ -688,8 +736,25 @@ def _format_sql_result(
     return payload
 
 
+async def _execute_query(sql: str) -> list[dict[str, Any]]:
+    """Execute SQL via query_athena_tool com tracing."""
+    result_str = await query_athena_tool.ainvoke({"sql": sql})
+
+    if result_str.startswith("Consulta inválida") or result_str.startswith("Erro ao acessar"):
+        raise ValueError(result_str)
+
+    if result_str in ("Nenhum resultado encontrado para esta consulta.", ""):
+        return []
+
+    try:
+        return json.loads(result_str)
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Falha ao parsear resultado da tool: {e}")
+        raise ValueError(f"Resultado inválido da ferramenta Athena: {result_str[:200]}")
+
+
 @traceable(name="sql_analyst_expert", as_type="span")
-def sql_analyst_expert(
+async def sql_analyst_expert(
     query: str,
     rag_context: str,
     output_mode: Optional[str] = None,
@@ -732,7 +797,7 @@ def sql_analyst_expert(
     )
 
     try:
-        sql = _generate_sql(
+        sql = await _generate_sql(
             query=query,
             rag_context=rag_context,
             output_mode=resolved_output_mode,
@@ -749,7 +814,7 @@ def sql_analyst_expert(
         except ValueError as semantic_error:
             logger.warning(f"SQL rejeitado por validação semântica: {semantic_error}")
 
-            sql = _repair_sql_for_semantics(
+            sql = await _repair_sql_for_semantics(
                 original_sql=sql,
                 semantic_error=str(semantic_error),
                 query=query,
@@ -799,9 +864,8 @@ def sql_analyst_expert(
         }
 
     try:
-        results = _execute_athena_query(sql)
+        results = await _execute_query(sql)
 
-        # Captura os dados brutos no contexto para uso pelo Agente Avaliador
         captured = athena_results_context.get([])
         athena_results_context.set(captured + [{"sql": sql, "results": results}])
 
@@ -835,54 +899,20 @@ def sql_analyst_expert(
             logger.info("SQL Analyst: Tentando corrigir SQL e reexecutar (retry 1)...")
 
             try:
-                llm = get_chat_model_openai(temperature=0.0, model="gpt-4.1-mini")
-
-                shape_contract = _build_query_shape_contract(
+                fixed_sql = await _repair_sql_for_execution(
+                    original_sql=sql,
+                    error_msg=error_msg,
+                    query=query,
                     query_shape=query_shape,
                     output_mode=resolved_output_mode,
                     sample_size=sample_size,
                     detail_limit=detail_limit,
                 )
 
-                fix_prompt = f"""O SQL abaixo causou erro no AWS Athena/Presto.
-
-Pergunta original:
-{query}
-
-query_shape:
-{query_shape}
-
-output_mode:
-{resolved_output_mode}
-
-Contrato do tipo de consulta:
-{shape_contract}
-
-SQL com erro:
-{sql}
-
-Erro:
-{error_msg}
-
-Corrija o SQL para ser compatível com Presto/Athena e respeitar o schema:
-pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
-
-Regras obrigatorias:
-- Nunca usar SELECT *.
-- Preserve dados brutos quando a pergunta pedir registros individuais.
-- Retorne APENAS o SQL corrigido, sem markdown e sem explicacoes.
-"""
-
-                fix_response = llm.invoke(
-                    [{"role": "user", "content": fix_prompt}],
-                    config={"callbacks": get_langfuse_callbacks()},
-                )
-                fixed_sql = _strip_markdown_sql(fix_response.content)
-
                 _semantic_validate_sql(fixed_sql, query_shape, query)
                 validate_sql(fixed_sql)
 
-                results = _execute_athena_query(fixed_sql)
+                results = await _execute_query(fixed_sql)
 
                 captured = athena_results_context.get([])
                 athena_results_context.set(captured + [{"sql": fixed_sql, "results": results}])

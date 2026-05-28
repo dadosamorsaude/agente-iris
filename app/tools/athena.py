@@ -1,5 +1,7 @@
 import asyncio
+import json
 from contextvars import ContextVar
+from typing import Any
 from pyathena import connect
 from app.core.config import settings
 from langchain_core.tools import tool
@@ -25,7 +27,7 @@ def validate_sql(sql: str) -> None:
         raise ValueError("SELECT * não é permitido. Por favor, liste as colunas explicitamente.")
 
 
-def _execute_athena_query(sql: str):
+def _execute_athena_query(sql: str) -> list[dict[str, Any]]:
     """Internal synchronous function to execute the query."""
     conn = None
     cursor = None
@@ -54,6 +56,12 @@ def _execute_athena_query(sql: str):
             conn.close()
 
 
+@traceable(name="execute_athena_query", as_type="tool")
+def _execute_traced(sql: str) -> list[dict[str, Any]]:
+    """Traced wrapper around _execute_athena_query for observability."""
+    return _execute_athena_query(sql)
+
+
 @tool
 @traceable(name="query_athena_tool")
 async def query_athena_tool(sql: str) -> str:
@@ -62,7 +70,6 @@ async def query_athena_tool(sql: str) -> str:
     A query deve ser compatível com Presto/Athena.
     Retorne apenas dados relevantes. Limite sempre a 20 linhas.
     """
-    # Validate SQL before execution
     try:
         validate_sql(sql)
     except ValueError as e:
@@ -72,10 +79,8 @@ async def query_athena_tool(sql: str) -> str:
     logger.info(f"Ferramenta Athena executando (async): {sql}")
 
     try:
-        # Executa a query síncrona em uma thread separada para não bloquear o loop de eventos
-        results = await asyncio.to_thread(_execute_athena_query, sql)
+        results = await asyncio.to_thread(_execute_traced, sql)
 
-        # Captura os dados brutos no contexto para uso pelo Agente Avaliador
         captured = athena_results_context.get([])
         athena_results_context.set(captured + [{"sql": sql, "results": results}])
 
@@ -84,7 +89,7 @@ async def query_athena_tool(sql: str) -> str:
             return "Nenhum resultado encontrado para esta consulta."
 
         logger.info(f"Ferramenta Athena: Retornadas {len(results)} linhas com sucesso.")
-        return str(results)
+        return json.dumps(results, default=str, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("Erro na ferramenta Athena")

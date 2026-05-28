@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.logger import logger
-from app.core.observability import configure_langfuse_env, flush_langfuse
+from app.core.observability import configure_langsmith, flush_langsmith
 
 
 @asynccontextmanager
@@ -24,14 +24,14 @@ async def lifespan(app: FastAPI):
     - Shutdown: faz flush de todos os traces pendentes antes de encerrar.
     """
     # --- Startup ---
-    configure_langfuse_env()
-    logger.info("Langfuse configurado no startup.")
+    configure_langsmith()
+    logger.info("LangSmith configurado no startup.")
 
     yield
 
     # --- Shutdown ---
-    logger.info("Encerrando aplicação — fazendo flush do Langfuse...")
-    flush_langfuse()
+    logger.info("Encerrando aplicação — fazendo flush do LangSmith...")
+    flush_langsmith()
     logger.info("Shutdown concluído.")
 
 

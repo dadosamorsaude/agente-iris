@@ -10,10 +10,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from langchain_openai import ChatOpenAI
-
-from app.core.config import settings
-from app.core.observability import get_langfuse_callbacks, traceable
+from app.core.observability import traceable
+from app.services.llm import get_chat_model_openai
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +82,8 @@ EVALUATOR_USER_TEMPLATE = """
 # Avaliador Principal
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _get_evaluator_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=settings.MODEL_NAME,
-        temperature=0.0,
-        api_key=settings.OPENAI_API_KEY,
-        callbacks=get_langfuse_callbacks(),
-    )
+def _get_evaluator_llm():
+    return get_chat_model_openai(temperature=0.0)
 
 
 @traceable(name="judge_metric", as_type="span")
