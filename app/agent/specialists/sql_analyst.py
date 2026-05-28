@@ -447,7 +447,7 @@ Use a pergunta do usuario como fonte principal de decisao. Voce pode retornar:
 
 Regras de liberdade controlada:
 - Se o usuario pedir dados brutos, registros, casos, pacientes, atendimentos, amostra ou evidencias, preserve linhas individuais.
-- Para registros individuais, inclua o maximo de campos uteis do prontuario: ids, data, paciente, profissional, clinica, textos clinicos, CID, assinatura, exame, prescricao, orientacao, conduta e evidencias.
+- Para registros individuais, inclua SEMPRE os campos textuais/narrativos: anamnese, conduta, hipotese_diagnostica, observacao, orientacao, solicitacao, prescricao, exame_solicitado, obs_atend_oftalmo, cid_descricao_detalhada, alem de ids, data, paciente, profissional e clinica.
 - Para metricas, use agregacoes livremente, mas mantenha nomes de colunas claros.
 - Para respostas mistas, separe resumo e detalhes em CTEs e retorne ambos no resultado final.
 - Se precisar limitar registros brutos, prefira row_number() em CTE e filtre rn <= {detail_limit}.
