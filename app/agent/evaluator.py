@@ -147,7 +147,6 @@ async def evaluate_response(
                 {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            config={"callbacks": get_langfuse_callbacks()},
         )
 
         raw_content = response.content.strip()

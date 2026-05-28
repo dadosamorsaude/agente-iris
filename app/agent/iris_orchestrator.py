@@ -9,6 +9,14 @@ implementa o fluxo de raciocínio profundo (Multi-Agent Deep Architecture):
   4. Iris Synthesizer (LLM)
   5. Quality Judge como metrica assincrona
   6. Self-Learning & Persistent Logger
+
+MELHORIAS:
+- load_curated_lessons + RAG são executados em paralelo (asyncio.gather)
+- Callbacks Langfuse passados apenas no construtor, não duplicados no ainvoke
+- Streaming SSE real com tokens enviados ao cliente imediatamente
+- detect_intent() de services/intent.py integrado (elimina lógica duplicada)
+- extract_text_from_content() robusto para conteúdo multi-modal
+- Tratamento de asyncio.CancelledError no streaming
 """
 
 import asyncio
@@ -17,7 +25,7 @@ import logging
 import re
 import uuid
 from datetime import date
-from typing import AsyncGenerator, Any
+from typing import Any, AsyncGenerator
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -26,6 +34,7 @@ from app.core.config import settings
 from app.core.observability import flush_langfuse, get_langfuse_callbacks, traceable
 from app.services.learning import load_curated_lessons, generate_lessons_from_execution, save_learned_lessons
 from app.services.evaluation_store import save_execution_log
+from app.services.intent import detect_intent
 from app.agent.evaluator import evaluate_response
 from app.agent.specialists.clinical_rag import clinical_rag_expert
 from app.agent.specialists.sql_analyst import sql_analyst_expert
@@ -36,9 +45,12 @@ from app.tools.rag import rag_results_context
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de Texto
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _normalize_for_gate(text: str) -> str:
     import unicodedata
-
     normalized = text.lower()
     normalized = "".join(
         c for c in unicodedata.normalize("NFD", normalized)
@@ -47,33 +59,53 @@ def _normalize_for_gate(text: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
+def extract_text_from_content(content: Any) -> str:
+    """
+    Extrai apenas texto legível de conteúdo LangChain/Anthropic/OpenAI.
+    Ignora blocos tool_use, input_json_delta e outros conteúdos estruturados.
+    Trazido do projeto de referência ai-agent para robustez com múltiplos modelos.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append(str(text))
+                continue
+            item_type = getattr(item, "type", None)
+            if item_type == "text":
+                text = getattr(item, "text", "")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    if isinstance(content, dict):
+        if content.get("type") == "text":
+            return str(content.get("text", ""))
+        return ""
+    content_type = getattr(content, "type", None)
+    if content_type == "text":
+        return str(getattr(content, "text", ""))
+    return ""
+
+
 def _classify_light_interaction(message: str) -> str | None:
+    """Detecta interações simples (saudações, agradecimentos) sem acionar o pipeline completo."""
     text = _normalize_for_gate(message)
 
-    greetings = {
-        "oi",
-        "ola",
-        "olá",
-        "bom dia",
-        "boa tarde",
-        "boa noite",
-        "e ai",
-        "eai",
-        "hello",
-        "hi",
-        "ping",
-    }
+    greetings = {"oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "e ai", "eai", "hello", "hi", "ping"}
     if text in greetings:
         return "Olá, eu sou a Iris, em que posso te ajudar?"
 
-    help_terms = {
-        "ajuda",
-        "help",
-        "comandos",
-        "como funciona",
-        "o que voce faz",
-        "o que você faz",
-    }
+    help_terms = {"ajuda", "help", "comandos", "como funciona", "o que voce faz", "o que você faz"}
     if text in help_terms:
         return (
             "Eu posso ajudar com análises de cirurgia de catarata, prontuários, "
@@ -87,75 +119,9 @@ def _classify_light_interaction(message: str) -> str | None:
     return None
 
 
-def _needs_rag_context(message: str) -> bool:
-    text = _normalize_for_gate(message)
-    terms = {
-        "criterio",
-        "criterios",
-        "regra",
-        "regras",
-        "classificacao",
-        "classificar",
-        "score",
-        "scoring",
-        "evidencia",
-        "evidencias",
-        "catarata",
-        "cirurgia",
-        "prontuario",
-        "prontuarios",
-        "conduta",
-        "anamnese",
-        "cid",
-        "diagnostico",
-        "diagnostica",
-        "qualidade",
-        "auditoria",
-        "conformidade",
-    }
-    return any(term in text for term in terms)
-
-
-def _needs_data_query(message: str) -> bool:
-    text = _normalize_for_gate(message)
-    terms = {
-        "quantos",
-        "quantas",
-        "total",
-        "percentual",
-        "porcentagem",
-        "taxa",
-        "media",
-        "contagem",
-        "distribuicao",
-        "ranking",
-        "evolucao",
-        "liste",
-        "listar",
-        "lista",
-        "mostre",
-        "mostrar",
-        "traga",
-        "retorne",
-        "casos",
-        "registros",
-        "linhas",
-        "pacientes",
-        "atendimentos",
-        "amostra",
-        "exemplos",
-        "base",
-        "dados",
-        "tabela",
-        "relatorio",
-        "clinica",
-        "regional",
-        "profissional",
-        "prontuario",
-        "prontuarios",
-    }
-    return any(term in text for term in terms) or bool(re.search(r"\b\d{5,}\b", text))
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread runners (para especialistas síncronos no executor)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _run_clinical_rag_in_thread(query: str):
     res = clinical_rag_expert(query)
@@ -178,7 +144,7 @@ Você receberá:
 - O contexto clínico (rag_context) com as regras da régua de catarata
 - Os dados do banco de dados (sql_result), quando a pergunta exigir consulta
 - Aprendizados preventivos do projeto (memory_context) como checklist operacional
-- O plano de ferramentas escolhidas para a intera??o
+- O plano de ferramentas escolhidas para a interação
 
 ## Uso dos Aprendizados do Projeto
 Os aprendizados são um checklist preventivo. Use-os para evitar erros recorrentes já identificados.
@@ -287,8 +253,12 @@ async def _iris_synthesize(
     memory_context: str,
     history_messages: list,
     hoje: str = "",
-) -> dict:
-    """Invoca o LLM sintetizador e parseia o JSON de saída."""
+    stream: bool = False,
+) -> dict | AsyncGenerator:
+    """
+    Invoca o LLM sintetizador e parseia o JSON de saída.
+    Se stream=True, emite tokens em tempo real ao invés de aguardar resposta completa.
+    """
     system = IRIS_SYNTHESIZER_SYSTEM
     user_content = _build_synthesizer_prompt(
         user_question, query_plan, rag_context, sql_result,
@@ -296,15 +266,18 @@ async def _iris_synthesize(
     )
 
     messages = [SystemMessage(content=system)] + history_messages + [HumanMessage(content=user_content)]
-
     llm = _get_llm()
-    response = await llm.ainvoke(messages, config={"callbacks": get_langfuse_callbacks()})
 
-    raw = response.content.strip() if hasattr(response, "content") else str(response)
+    if stream:
+        # Retorna o gerador para streaming — o orquestrador lida com os chunks
+        return llm.astream(messages)
+
+    # Modo não-streaming: aguarda resposta completa
+    response = await llm.ainvoke(messages)
+    raw = extract_text_from_content(getattr(response, "content", None)) or str(response)
     parsed = _safe_json(raw)
 
     if not parsed:
-        # Fallback: retorna texto bruto como final_answer
         logger.warning("Iris Synthesizer: resposta não é JSON válido, usando texto bruto.")
         return {
             "final_answer": raw,
@@ -336,8 +309,12 @@ async def run_iris_agent(
     """
     Ponto de entrada principal do sistema Iris Deep Agent.
     Orquestra todos os especialistas e retorna a resposta final.
-    - Se stream=True, emite chunks de texto à medida que o LLM responde.
-    - Se stream=False, emite a resposta final única.
+
+    Melhorias de latência:
+    - load_curated_lessons + RAG executam em paralelo (asyncio.gather)
+    - Chamadas HTTP ao Supabase são assíncronas
+    - Streaming SSE envia tokens em tempo real (stream=True)
+    - detect_intent() substitui lógica duplicada de roteamento
     """
     logger.info(f"Iris Deep Agent iniciado | user_id={user_id} | stream={stream}")
 
@@ -354,6 +331,7 @@ async def run_iris_agent(
     athena_results_context.set([])
     rag_results_context.set([])
 
+    # ── Fast-path: interações leves (saudações, agradecimentos) ──────────────
     light_answer = _classify_light_interaction(message)
     if light_answer:
         history = get_session_history(effective_session)
@@ -393,41 +371,76 @@ async def run_iris_agent(
         yield light_answer
         return
 
+    # ── Detecta intenção via serviço dedicado (elimina lógica duplicada) ─────
+    intent = detect_intent(message)
+    should_use_rag = not intent["is_simple"]
+    should_use_sql = not intent["is_simple"] and (
+        intent["has_aggregation_intent"] or intent["wants_rows"] or intent["sample_mode"]
+    )
+
     query_plan = {
         "routing": "agent_decides_tools",
-        "output_mode": None,
-        "sample_size": 5,
-    }
-
-    memory_context = load_curated_lessons()
-    history = get_session_history(effective_session)
-    recent_messages = list(history.messages)[-8:]
-    rag_context = ""
-    loop = asyncio.get_event_loop()
-    should_use_rag = _needs_rag_context(message)
-    should_use_sql = _needs_data_query(message)
-
-    query_plan.update({
+        "output_mode": intent.get("output_mode"),
+        "sample_size": intent.get("sample_size") or 5,
         "rag_policy": "on_demand",
         "sql_policy": "on_demand",
         "rag_requested": should_use_rag,
         "sql_requested": should_use_sql,
-    })
+    }
+
+    history = get_session_history(effective_session)
+    recent_messages = list(history.messages)[-8:]
+    loop = asyncio.get_event_loop()
+
+    # ── PARALELIZAÇÃO: memory + RAG executam simultaneamente ─────────────────
+    rag_context = ""
+    captured_rag = []
 
     if should_use_rag:
         try:
-            rag_context, captured_rag = await loop.run_in_executor(None, _run_clinical_rag_in_thread, message)
-            rag_results_context.set(captured_rag)
-            logger.info("RAG Expert concluido sob demanda.")
+            # Executa load_curated_lessons (async) e RAG (sync→executor) em paralelo
+            memory_task = load_curated_lessons()
+            rag_executor_task = loop.run_in_executor(None, _run_clinical_rag_in_thread, message)
+
+            memory_context, rag_result = await asyncio.gather(
+                memory_task,
+                rag_executor_task,
+                return_exceptions=True,
+            )
+
+            # Trata exceções individuais do gather
+            if isinstance(memory_context, Exception):
+                logger.error(f"load_curated_lessons falhou: {memory_context}")
+                memory_context = '{"tipo":"aprendizados_curados_do_projeto","uso":"Erro ao carregar.","regras_prioritarias":[]}'
+
+            if isinstance(rag_result, Exception):
+                logger.error(f"RAG Expert falhou: {rag_result}")
+                rag_context = ""
+                captured_rag = []
+            else:
+                rag_context, captured_rag = rag_result
+                rag_results_context.set(captured_rag)
+                logger.info("RAG Expert concluído em paralelo com memory.")
+
         except Exception as e:
-            logger.error(f"RAG Expert falhou: {e}")
+            logger.error(f"Erro no gather memory+RAG: {e}")
+            memory_context = '{"tipo":"aprendizados_curados_do_projeto","uso":"Erro ao carregar.","regras_prioritarias":[]}'
     else:
-        logger.info("RAG Expert ignorado: pergunta nao exige contexto clinico.")
+        # RAG não necessário — carrega apenas memory
+        try:
+            memory_context = await load_curated_lessons()
+        except Exception as e:
+            logger.error(f"load_curated_lessons falhou: {e}")
+            memory_context = '{"tipo":"aprendizados_curados_do_projeto","uso":"Erro ao carregar.","regras_prioritarias":[]}'
+        logger.info("RAG Expert ignorado: pergunta não exige contexto clínico.")
 
     rag_used = bool(rag_context)
 
+    # ── SQL Analyst (depende de rag_context, roda sequencialmente) ───────────
     sql_result = {}
     sql_used = False
+    captured_athena = []
+
     if should_use_sql:
         try:
             sql_result, captured_athena = await loop.run_in_executor(
@@ -435,43 +448,102 @@ async def run_iris_agent(
                 _run_sql_analyst_in_thread,
                 message,
                 rag_context,
-                None,
+                query_plan["output_mode"],
                 query_plan["sample_size"],
                 hoje,
-                0
+                0,
             )
             athena_results_context.set(captured_athena)
             sql_used = sql_result.get("execution_status") != "error"
-            logger.info(f"SQL Analyst concluido sob demanda | status={sql_result.get('execution_status')} | row_count={sql_result.get('row_count', 0)}")
+            logger.info(
+                f"SQL Analyst concluído | status={sql_result.get('execution_status')} "
+                f"| row_count={sql_result.get('row_count', 0)}"
+            )
         except Exception as e:
             logger.error(f"SQL Analyst falhou: {e}")
-            sql_result = {"execution_status": "error", "error": {"message": str(e)}, "rows": [], "summary": {}, "row_count": 0}
+            sql_result = {
+                "execution_status": "error",
+                "error": {"message": str(e)},
+                "rows": [],
+                "summary": {},
+                "row_count": 0,
+            }
     else:
-        logger.info("SQL Analyst ignorado: pergunta nao exige consulta de dados.")
+        logger.info("SQL Analyst ignorado: pergunta não exige consulta de dados.")
 
     query_plan.update({
         "query_shape": sql_result.get("query_shape"),
-        "output_mode": sql_result.get("output_mode"),
+        "output_mode": sql_result.get("output_mode") or query_plan["output_mode"],
         "intent_reason": sql_result.get("intent_reason"),
     })
 
-    try:
-        synth_result = await _iris_synthesize(
-            message, query_plan, rag_context, sql_result,
-            memory_context, recent_messages, hoje=hoje
-        )
-    except Exception as e:
-        logger.exception("Iris Synthesizer falhou")
-        synth_result = {
-            "final_answer": "Não foi possível gerar uma resposta no momento. Tente novamente.",
-            "analysis_type": "erro", "error": True,
-            "errorType": "synthesizer_error", "errorMessage": str(e),
-            "rag_used": rag_used, "sql_used": sql_used, "user_asked_for_sql": False,
-        }
+    # ── Iris Synthesizer ──────────────────────────────────────────────────────
+    final_answer = ""
 
+    if stream:
+        # Streaming real: envia tokens ao cliente à medida que o LLM responde
+        full_response_parts = []
+        try:
+            stream_gen = await _iris_synthesize(
+                message, query_plan, rag_context, sql_result,
+                memory_context, recent_messages, hoje=hoje, stream=True
+            )
+            async for chunk in stream_gen:
+                token = extract_text_from_content(getattr(chunk, "content", None))
+                if token:
+                    full_response_parts.append(token)
+                    yield token
+
+        except asyncio.CancelledError:
+            logger.warning("Streaming Iris cancelado pelo cliente.")
+            return
+        except Exception as e:
+            logger.exception("Iris Synthesizer falhou durante streaming")
+            error_msg = "Não foi possível gerar uma resposta no momento. Tente novamente."
+            yield error_msg
+            full_response_parts = [error_msg]
+
+        raw_streamed = "".join(full_response_parts)
+        # Tenta parsear o JSON da resposta completa do stream
+        parsed = _safe_json(raw_streamed)
+        if parsed:
+            final_answer = parsed.get("final_answer", raw_streamed)
+            synth_result = parsed
+        else:
+            final_answer = raw_streamed
+            synth_result = {
+                "final_answer": final_answer,
+                "analysis_type": "nao_aplicavel",
+                "error": False,
+                "errorType": None,
+                "errorMessage": None,
+            }
+
+    else:
+        # Modo não-streaming: aguarda resposta completa e retorna de uma vez
+        try:
+            synth_result = await _iris_synthesize(
+                message, query_plan, rag_context, sql_result,
+                memory_context, recent_messages, hoje=hoje, stream=False
+            )
+        except Exception as e:
+            logger.exception("Iris Synthesizer falhou")
+            synth_result = {
+                "final_answer": "Não foi possível gerar uma resposta no momento. Tente novamente.",
+                "analysis_type": "erro",
+                "error": True,
+                "errorType": "synthesizer_error",
+                "errorMessage": str(e),
+                "rag_used": rag_used,
+                "sql_used": sql_used,
+                "user_asked_for_sql": False,
+            }
+
+        final_answer = synth_result.get("final_answer", "Não foi possível gerar uma resposta.")
+
+    # ── Pós-processamento comum ───────────────────────────────────────────────
     synth_result["rag_used"] = rag_used
     synth_result["sql_used"] = sql_used
-    final_answer = synth_result.get("final_answer", "Nao foi possivel gerar uma resposta.")
     synth_result.update({
         "job_id": job_id,
         "sessionId": effective_session,
@@ -495,9 +567,11 @@ async def run_iris_agent(
         message, synth_result, raw_athena, raw_rag
     ))
 
-    yield final_answer
+    if not stream:
+        yield final_answer
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Post-Execution: Auto-Learning + Logging (background)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -535,17 +609,16 @@ async def _post_execution(
         # Auto-Learning: gera e salva lições a partir das métricas coletadas.
         lessons = generate_lessons_from_execution(result)
         if lessons:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, save_learned_lessons, lessons)
+            await save_learned_lessons(lessons)
             logger.info(f"Auto-Learning: {len(lessons)} lição(ões) salva(s).")
 
-        # Logging de execução
+        # Logging de execução (async)
         await save_execution_log(
             job_id=job_id,
             session_id=session_id,
             conversation_id=conversation_id,
             original_input=original_input,
-            result=result
+            result=result,
         )
     except Exception as e:
         logger.error(f"Erro no post-execution da Iris: {e}")

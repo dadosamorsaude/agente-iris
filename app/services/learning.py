@@ -1,6 +1,9 @@
+import asyncio
 import json
 import logging
+
 import httpx
+
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -15,7 +18,7 @@ def _get_headers() -> dict:
     }
 
 
-def load_curated_lessons(memory_key: str = "iris_catarata") -> str:
+async def load_curated_lessons(memory_key: str = "iris_catarata") -> str:
     """
     Busca via Supabase REST até 15 aprendizados ativos curados da Iris e formata como checklist de prompt.
     """
@@ -32,8 +35,9 @@ def load_curated_lessons(memory_key: str = "iris_catarata") -> str:
             "limit": "15"
         }
         
-        response = httpx.get(url, headers=_get_headers(), params=params, timeout=10.0)
-        response.raise_for_status()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=_get_headers(), params=params)
+            response.raise_for_status()
         rows = response.json()
 
         # Re-ordenação em Python para simular o CASE condicional da query antiga
@@ -259,7 +263,7 @@ def generate_lessons_from_execution(execution_data: dict) -> list[dict]:
     return final_lessons
 
 
-def save_learned_lessons(lessons: list[dict]) -> None:
+async def save_learned_lessons(lessons: list[dict]) -> None:
     """
     Grava no Supabase via API REST (UPSERT) os novos aprendizados coletados pela Iris.
     """
@@ -289,8 +293,9 @@ def save_learned_lessons(lessons: list[dict]) -> None:
                 "active": True
             })
 
-        response = httpx.post(url, headers=headers, json=payload, timeout=10.0)
-        response.raise_for_status()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
 
         logger.info(f"Salvos {len(lessons)} aprendizados/lições via REST no Supabase.")
     except Exception as e:
