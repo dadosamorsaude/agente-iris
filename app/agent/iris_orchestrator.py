@@ -299,6 +299,7 @@ async def _iris_synthesize(
 # Iris Run Agent — Ponto de entrada principal
 # ─────────────────────────────────────────────────────────────────────────────
 
+@traceable(name="run_iris_agent", as_type="chain")
 async def run_iris_agent(
     user_id: str,
     message: str,
@@ -400,7 +401,7 @@ async def run_iris_agent(
         try:
             # Executa load_curated_lessons (async) e RAG (sync→executor) em paralelo
             memory_task = load_curated_lessons()
-            rag_executor_task = loop.run_in_executor(None, _run_clinical_rag_in_thread, message)
+            rag_executor_task = asyncio.to_thread(_run_clinical_rag_in_thread, message)
 
             memory_context, rag_result = await asyncio.gather(
                 memory_task,
@@ -443,8 +444,7 @@ async def run_iris_agent(
 
     if should_use_sql:
         try:
-            sql_result, captured_athena = await loop.run_in_executor(
-                None,
+            sql_result, captured_athena = await asyncio.to_thread(
                 _run_sql_analyst_in_thread,
                 message,
                 rag_context,
