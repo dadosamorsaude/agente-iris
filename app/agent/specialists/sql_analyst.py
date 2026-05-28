@@ -868,7 +868,6 @@ Corrija o SQL para ser compatível com Presto/Athena e respeitar o schema:
 pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
 
 Regras obrigatorias:
-- Sempre manter id_especialidade = 661.
 - Nunca usar SELECT *.
 - Preserve dados brutos quando a pergunta pedir registros individuais.
 - Retorne APENAS o SQL corrigido, sem markdown e sem explicacoes.
