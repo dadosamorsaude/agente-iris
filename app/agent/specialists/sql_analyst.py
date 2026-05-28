@@ -455,18 +455,49 @@ Regras de liberdade controlada:
 """
 
 
-def _semantic_validate_sql(sql: str, query_shape: str, original_query: str) -> None:
-    """Mantem apenas validacoes que evitam erro real ou risco amplo."""
-    sql_lower = normalize_text(sql)
+# Colunas padrão para substituir SELECT * automaticamente
+_DEFAULT_COLUMNS = [
+    "id_atendimento", "id_paciente", "nome_paciente", "data_atendimento",
+    "id_especialidade", "especialidade",
+    "anamnese", "conduta", "hipotese_diagnostica",
+    "cid_codigo", "cid_descricao_detalhada",
+    "id_clinica", "clinica", "regional", "uf", "municipio",
+    "id_profissional", "nome_profissional",
+    "prontuario_assinado",
+    "prescricao", "flg_prescricao_cirurgica",
+    "solicitacao", "exame_solicitado",
+    "observacao", "orientacao", "obs_atend_oftalmo",
+    "atestado", "posologia",
+]
 
-    if not sql_lower:
+
+def _replace_select_star(sql: str) -> str:
+    """Substitui SELECT * por colunas explícitas."""
+    cols = ",\n        ".join(_DEFAULT_COLUMNS)
+    return re.sub(
+        r'\bselect\s+\*\b',
+        f"SELECT\n        {cols}",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+
+def _semantic_validate_sql(sql: str, query_shape: str, original_query: str) -> str:
+    """Valida e corrige o SQL. Retorna o SQL corrigido (pode substituir SELECT *)."""
+    sql_normalized = normalize_text(sql)
+
+    if not sql_normalized:
         raise ValueError("SQL vazio gerado pelo LLM.")
 
-    if re.search(r"\bselect\s+\*", sql_lower):
-        raise ValueError("SQL invalido semanticamente: SELECT * nao e permitido.")
+    if re.search(r"\bselect\s+\*", sql_normalized):
+        corrected = _replace_select_star(sql)
+        logger.info("SELECT * substituído por colunas explícitas")
+        return corrected
 
-    if "id_especialidade = 661" not in sql_lower and "id_especialidade=661" not in sql_lower:
+    if "id_especialidade = 661" not in sql_normalized and "id_especialidade=661" not in sql_normalized:
         raise ValueError("SQL invalido semanticamente: filtro obrigatorio id_especialidade = 661 ausente.")
+
+    return sql
 
 
 @traceable(name="generate_sql", as_type="llm")
@@ -571,7 +602,7 @@ Erro:
 SQL anterior:
 {original_sql}
 
-Regenere a consulta do zero. O query_shape '{query_shape}' e apenas uma preferencia; responda a pergunta do usuario com a forma de dados mais util.
+Regenere a consulta do zero. NUNCA use SELECT * — liste as colunas explícitas do schema relevantes para a pergunta. O query_shape '{query_shape}' e apenas uma preferencia; responda a pergunta do usuario com a forma de dados mais util.
 """
 
     return await _generate_sql(
@@ -803,7 +834,7 @@ async def sql_analyst_expert(
         logger.info(f"SQL gerado:\n{sql}")
 
         try:
-            _semantic_validate_sql(sql, query_shape, query)
+            sql = _semantic_validate_sql(sql, query_shape, query)
         except ValueError as semantic_error:
             logger.warning(f"SQL rejeitado por validação semântica: {semantic_error}")
 
@@ -820,7 +851,27 @@ async def sql_analyst_expert(
             )
 
             logger.info(f"SQL regenerado após validação semântica:\n{sql}")
-            _semantic_validate_sql(sql, query_shape, query)
+
+            try:
+                sql = _semantic_validate_sql(sql, query_shape, query)
+            except ValueError as e:
+                logger.error(f"Repair também falhou validação semântica: {e}")
+
+                return {
+                    "execution_status": "error",
+                    "error": {
+                        "type": "sql_validation_error",
+                        "message": f"Repair falhou: {e}",
+                    },
+                    "summary": {},
+                    "rows": [],
+                    "row_count": 0,
+                    "sql": sql,
+                    "query_shape": query_shape,
+                    "output_mode": resolved_output_mode,
+                    "intent_reason": intent.get("reason"),
+                    "limitations": [f"Repair semântico falhou: {e}"],
+                }
 
     except Exception as e:
         logger.error(f"Falha ao gerar SQL: {e}")
@@ -911,7 +962,7 @@ async def sql_analyst_expert(
                     sample_size=sample_size,
                     detail_limit=detail_limit,
                 )
-                _semantic_validate_sql(current_sql, query_shape, query)
+                current_sql = _semantic_validate_sql(current_sql, query_shape, query)
                 validate_sql(current_sql)
 
     logger.error(f"SQL Analyst: Todas as {max_attempts} tentativas falharam")
