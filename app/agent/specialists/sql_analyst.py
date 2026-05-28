@@ -753,7 +753,7 @@ async def _execute_query(sql: str) -> list[dict[str, Any]]:
         raise ValueError(f"Resultado inválido da ferramenta Athena: {result_str[:200]}")
 
 
-@traceable(name="sql_analyst_expert", as_type="span")
+@traceable(name="sql_analyst_expert", as_type="chain")
 async def sql_analyst_expert(
     query: str,
     rag_context: str,

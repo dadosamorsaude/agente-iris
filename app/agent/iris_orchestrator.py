@@ -174,7 +174,7 @@ def _build_synthesizer_prompt(
 # Iris Synthesizer (chamada ao LLM)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@traceable(name="iris_synthesize", as_type="span")
+@traceable(name="iris_synthesize", as_type="chain")
 async def _iris_synthesize(
     user_question: str,
     query_plan: dict,
@@ -475,7 +475,7 @@ async def run_iris_agent(
 # Post-Execution: Auto-Learning + Logging (background)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@traceable(name="iris_post_execution", as_type="span")
+@traceable(name="iris_post_execution", as_type="chain")
 async def _post_execution(
     job_id: str,
     session_id: str,

@@ -86,7 +86,7 @@ def _get_evaluator_llm():
     return get_chat_model_openai(temperature=0.0)
 
 
-@traceable(name="judge_metric", as_type="span")
+@traceable(name="judge_metric", as_type="chain")
 async def evaluate_response(
     user_question: str,
     agent_response: str,

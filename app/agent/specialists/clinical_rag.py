@@ -8,7 +8,7 @@ from app.services.llm import get_chat_model_openai
 logger = logging.getLogger(__name__)
 
 
-@traceable(name="clinical_rag_expert", as_type="span")
+@traceable(name="clinical_rag_expert", as_type="chain")
 async def clinical_rag_expert(query: str) -> str:
     logger.info(f"Clinical RAG Expert consultando RAG Catarata para query: '{query}'")
 
