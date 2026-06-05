@@ -25,6 +25,7 @@ from app.core.observability import get_langsmith_callbacks, traceable
 from app.services.intent import normalize_text
 from app.tools.athena import query_athena_tool, validate_sql, athena_results_context
 from app.services.llm import get_chat_model_openai
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +371,7 @@ def _resolve_query_shape(
         return {
             "query_shape": "detail",
             "output_mode": "detail",
-            "limit": _detect_requested_limit(text, 20),
+            "limit": _detect_requested_limit(text, 0),
             "reason": "Modo detalhado solicitado explicitamente.",
         }
 
@@ -386,7 +387,7 @@ def _resolve_query_shape(
         return {
             "query_shape": "mixed",
             "output_mode": "mixed",
-            "limit": _detect_requested_limit(text, 20),
+            "limit": _detect_requested_limit(text, 0),
             "reason": "Modo misto solicitado explicitamente.",
         }
 
@@ -406,7 +407,7 @@ def _resolve_query_shape(
         return {
             "query_shape": "mixed",
             "output_mode": "mixed",
-            "limit": _detect_requested_limit(text, 20),
+            "limit": _detect_requested_limit(text, 0),
             "reason": "Pedido combina metrica e dados brutos.",
         }
 
@@ -414,7 +415,7 @@ def _resolve_query_shape(
         return {
             "query_shape": "detail",
             "output_mode": "detail",
-            "limit": _detect_requested_limit(text, 20),
+            "limit": _detect_requested_limit(text, 0),
             "reason": "Pedido pede ou sugere registros individuais.",
         }
 
@@ -429,16 +430,18 @@ def _resolve_query_shape(
     return {
         "query_shape": "detail",
         "output_mode": "detail",
-        "limit": _detect_requested_limit(text, 20),
+        "limit": _detect_requested_limit(text, 0),
         "reason": "Fallback simples: preservar dados brutos.",
     }
 
 
 def _build_query_shape_contract(query_shape: str, output_mode: str, sample_size: int, detail_limit: int) -> str:
+    limit_instruction = f"- Se precisar limitar registros brutos, prefira row_number() em CTE e filtre rn <= {detail_limit}." if detail_limit > 0 else "- Não limite o número de registros retornados, traga todos os resultados solicitados."
+    
     return f"""
 Preferencia inicial de consulta: {query_shape}
 Modo de saida preferido: {output_mode}
-Limite preferido para linhas detalhadas: {detail_limit}
+Limite preferido para linhas detalhadas: {detail_limit if detail_limit > 0 else 'Nenhum'}
 
 Use a pergunta do usuario como fonte principal de decisao. Voce pode retornar:
 - aggregate: metricas, totais, percentuais, rankings, recortes ou series temporais.
@@ -447,10 +450,11 @@ Use a pergunta do usuario como fonte principal de decisao. Voce pode retornar:
 
 Regras de liberdade controlada:
 - Se o usuario pedir dados brutos, registros, casos, pacientes, atendimentos, amostra ou evidencias, preserve linhas individuais.
-- Para registros individuais, inclua SEMPRE os campos textuais/narrativos: anamnese, conduta, hipotese_diagnostica, observacao, orientacao, solicitacao, prescricao, exame_solicitado, obs_atend_oftalmo, cid_descricao_detalhada, alem de ids, data, paciente, profissional e clinica.
+- Para registros individuais, inclua SEMPRE os campos textuais/narrativos: anamnese, conduta, hipotese_diagnostica, observacao, orientacao, solicitacao, prescricao, exame_solicitado, obs_atend_oftalmo, cid_descricao_detalhada.
+- Para registros individuais, inclua SEMPRE explicitamente os identificadores reais e corretos do banco de dados: id_paciente, nome_paciente, id_atendimento, data_atendimento, id_profissional, nome_profissional, id_clinica, clinica. NUNCA omita, invente ou use IDs fictícios/alucinados.
 - Para metricas, use agregacoes livremente, mas mantenha nomes de colunas claros.
 - Para respostas mistas, separe resumo e detalhes em CTEs e retorne ambos no resultado final.
-- Se precisar limitar registros brutos, prefira row_number() em CTE e filtre rn <= {detail_limit}.
+{limit_instruction}
 - Nao use LIMIT.
 """
 
@@ -525,7 +529,7 @@ async def _generate_sql(
         detail_limit=detail_limit,
     )
 
-    llm = get_chat_model_openai(temperature=0.0, model="gpt-4.1-mini")
+    llm = get_chat_model_openai(temperature=0.0, model=settings.MODEL_NAME_SQL)
 
     system_prompt = f"""Você é um gerador de SQL Athena/Presto especializado em auditoria clínica de cirurgias de catarata.
 
@@ -562,7 +566,12 @@ Regras Cruciais:
 - Para texto, use lower(coalesce(campo, '')).
 - Para datas literais, use DATE 'YYYY-MM-DD'.
 - A data de referência atual é: {hoje}.
-- Se nenhum período foi solicitado, não invente filtro temporal.
+- Se um período foi extraído ({period_filter.strip()}), use rigorosamente o filtro temporal de data_atendimento fornecido. Não crie filtros temporais dinâmicos ou voláteis adicionais de data. Se nenhum período foi solicitado, não invente filtro temporal.
+- Regras de Contagem Determinística e Íntegra:
+  * Ao realizar contagens de atendimentos, consultas ou visitas, use obrigatoriamente COUNT(DISTINCT id_atendimento) (ou COUNT(1) se garantido que cada registro na CTE final represente um atendimento único).
+  * Ao realizar contagens de pacientes únicos ou casos clínicos de pacientes, use obrigatoriamente COUNT(DISTINCT id_paciente).
+  * Nunca use COUNT(*) de forma genérica se houver chance de duplicar ou distorcer contagens.
+  * Para contagens categorizadas por classificação clínica (Positivo, Provável, Negativo), os limiares e expressões de cálculo de score/classificação devem seguir exatamente as definições do RAG (rag_context).
 - Retorne APENAS o SQL puro, sem markdown, sem explicações, sem comentários.
 
 {extra_instruction}
@@ -644,7 +653,7 @@ async def _repair_sql_for_execution(
     detail_limit: int,
 ) -> str:
     """Tenta corrigir SQL que falhou na execução do Athena."""
-    llm = get_chat_model_openai(temperature=0.0, model="gpt-4.1-mini")
+    llm = get_chat_model_openai(temperature=0.0, model=settings.MODEL_NAME_SQL)
 
     shape_contract = _build_query_shape_contract(
         query_shape=query_shape,
@@ -737,15 +746,15 @@ def _format_sql_result(
             "limitations": ["Nenhum registro encontrado para os criterios informados."],
         }
 
-    max_rows = detail_limit if detail_limit > 0 else 200
+    max_rows = detail_limit if detail_limit > 0 else 0
     if query_shape == "aggregate" and output_mode == "summary":
-        max_rows = max(len(results), 200)
-    elif query_shape == "detail":
-        max_rows = detail_limit
-    elif query_shape == "mixed":
-        max_rows = detail_limit
+        max_rows = 0
 
-    rows_to_return = results[:max_rows]
+    if max_rows > 0:
+        rows_to_return = results[:max_rows]
+    else:
+        rows_to_return = results
+
     truncated = len(results) > len(rows_to_return)
     safe_rows = [_make_json_safe(row) for row in rows_to_return]
 
@@ -962,8 +971,16 @@ async def sql_analyst_expert(
                     sample_size=sample_size,
                     detail_limit=detail_limit,
                 )
-                current_sql = _semantic_validate_sql(current_sql, query_shape, query)
-                validate_sql(current_sql)
+                try:
+                    current_sql = _semantic_validate_sql(current_sql, query_shape, query)
+                    validate_sql(current_sql)
+                except ValueError as ve:
+                    logger.warning(f"SQL regenerado continuou inválido: {ve}")
+                    # A próxima iteração vai falhar ou será que passamos o erro? 
+                    # Deixamos tentar a próxima iteração com o SQL problemático, 
+                    # ou podemos colocar um 'continue' se fosse no try. Como estamos 
+                    # no final do except, o loop 'for attempt' vai naturalmente 
+                    # rodar a próxima iteração e bater no _execute_query que pode falhar.
 
     logger.error(f"SQL Analyst: Todas as {max_attempts} tentativas falharam")
 

@@ -53,7 +53,7 @@ async def clinical_rag_expert(query: str) -> str:
     formatted_treinamento = format_docs(docs_treinamento)
     formatted_vocabulario = format_docs(docs_vocabulario)
 
-    llm = get_chat_model_openai(temperature=0.0)
+    llm = get_chat_model_openai(temperature=0.0, model=settings.MODEL_NAME_SQL)
 
     system_prompt = (
         "Você é o RAG Blueprint do Iris Catarata.\n\n"
