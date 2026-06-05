@@ -10,7 +10,7 @@ check_eval.py
 final_test.py
 iris.json
 *.html
-*
+/*
 *.json
 !app/
 !app/core/
