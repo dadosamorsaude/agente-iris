@@ -10,8 +10,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Contexto por-task que armazena os dados brutos retornados pelo Athena.
-# Permite que o Agente Avaliador acesse os dados sem re-executar queries.
 athena_results_context: ContextVar[list] = ContextVar("athena_results", default=[])
 
 
@@ -20,11 +18,11 @@ def validate_sql(sql: str) -> None:
     sql_upper = sql.upper()
     forbidden = ["INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ", "TRUNCATE "]
     if any(token in sql_upper for token in forbidden):
-        logger.error(f"Operação proibida detectada no SQL: {sql}")
-        raise ValueError("SQL contém operação proibida. Apenas SELECT é permitido.")
+        logger.error(f"Operacao proibida detectada no SQL: {sql}")
+        raise ValueError("SQL contem operacao proibida. Apenas SELECT e permitido.")
 
     if "SELECT *" in sql_upper:
-        raise ValueError("SELECT * não é permitido. Por favor, liste as colunas explicitamente.")
+        raise ValueError("SELECT * nao e permitido. Por favor, liste as colunas explicitamente.")
 
 
 def _execute_athena_query(sql: str) -> list[dict[str, Any]]:
@@ -44,7 +42,12 @@ def _execute_athena_query(sql: str) -> list[dict[str, Any]]:
         cursor.execute(sql)
 
         columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchmany(20)
+
+        max_rows = getattr(settings, "ATHENA_MAX_ROWS", None)
+        if isinstance(max_rows, int) and max_rows > 0:
+            rows = cursor.fetchmany(max_rows)
+        else:
+            rows = cursor.fetchall()
 
         results = [dict(zip(columns, row)) for row in rows]
         return results
@@ -66,15 +69,15 @@ def _execute_traced(sql: str) -> list[dict[str, Any]]:
 @traceable(name="query_athena_tool")
 async def query_athena_tool(sql: str) -> str:
     """
-    Executa consultas SQL no AWS Athena para análise de prontuários médicos.
-    A query deve ser compatível com Presto/Athena.
-    Retorne apenas dados relevantes. Limite sempre a 20 linhas.
+    Executa consultas SQL no AWS Athena para analise de prontuarios medicos.
+    A query deve ser compativel com Presto/Athena.
+    O teto de linhas e controlado por settings.ATHENA_MAX_ROWS (default: sem teto).
     """
     try:
         validate_sql(sql)
     except ValueError as e:
-        logger.warning(f"SQL inválido rejeitado: {e}")
-        return f"Consulta inválida: {str(e)}"
+        logger.warning(f"SQL invalido rejeitado: {e}")
+        return f"Consulta invalida: {str(e)}"
 
     logger.info(f"Ferramenta Athena executando (async): {sql}")
 
@@ -93,4 +96,4 @@ async def query_athena_tool(sql: str) -> str:
 
     except Exception as e:
         logger.exception("Erro na ferramenta Athena")
-        return f"Erro ao acessar o banco de dados Athena: {str(e)}. Verifique se as credenciais e o nome do banco estão corretos."
+        return f"Erro ao acessar o banco de dados Athena: {str(e)}. Verifique credenciais e nome do banco."

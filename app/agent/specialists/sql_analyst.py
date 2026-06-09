@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, date
 from typing import Any, Optional
 
 from app.core.observability import get_langsmith_callbacks, traceable
-from app.services.intent import normalize_text
+from app.services.intent import normalize_text, detect_grouped_lists
 from app.tools.athena import query_athena_tool, validate_sql, athena_results_context
 from app.services.llm import get_chat_model_openai
 from app.core.config import settings
@@ -31,15 +31,15 @@ logger = logging.getLogger(__name__)
 
 # Schema oficial da tabela de catarata do N8N
 CATARATA_SCHEMA = """
-Tabela principal: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
+Tabela principal: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia (alias: fp)
 Dialeto: Athena/Presto SQL
 
-Colunas disponíveis:
+Colunas disponíveis em fp:
 - id_paciente: bigint
 - nome_paciente: string
 - id_atendimento: bigint
 - data_atendimento: date
-- id_especialidade: bigint (Sempre filtrar por id_especialidade = 661)
+- id_especialidade: bigint (informativo; a tabela ja vem pre-filtrada para oftalmologia)
 - especialidade: string
 - anamnese: string
 - conduta: string
@@ -66,13 +66,26 @@ Colunas disponíveis:
 - flg_prescricao_cirurgica: string
 - atestado: string
 
+Tabela de dimensao de pacientes (somente para enriquecer com CPF):
+pdgt_amorsaude_inteligencia.dm_pacientes_amei (alias: dp)
+- id_paciente: bigint (chave de join com fp.id_paciente)
+- cpf_paciente: string (CPF em texto, somente exibir mascarado)
+
+Regra de JOIN para CPF:
+- Use LEFT JOIN pdgt_amorsaude_inteligencia.dm_pacientes_amei dp ON dp.id_paciente = fp.id_paciente
+- Selecione dp.cpf_paciente APENAS quando o usuario pedir caracterizacao/segregacao
+  de pacientes ou listas detalhadas por grupo. Em consultas puramente agregadas,
+  NAO faca o join (evita custo desnecessario).
+
 Campos narrativos/textuais para busca clínica (narrative_fields):
 - anamnese, conduta, hipotese_diagnostica, observacao, orientacao, solicitacao,
   exame_solicitado, prescricao, posologia, obs_atend_oftalmo, atestado,
   cid_descricao_detalhada
 
 Filtros obrigatórios SEMPRE:
-1. id_especialidade = 661
+- Nenhum. A tabela fl_prontuarios_oftalmologia ja vem filtrada para atendimentos
+  de oftalmologia. NAO inclua filtro de id_especialidade — a coluna existe
+  apenas para referencia.
 
 Regras SQL Athena/Presto:
 - NUNCA use SELECT *
@@ -119,6 +132,52 @@ def _make_json_safe(value: Any) -> Any:
         return [_make_json_safe(v) for v in value]
 
     return value
+
+
+def _mask_cpf(value: Any) -> Optional[str]:
+    """Mascara CPF no formato ***.***.***-XX (mantem apenas os 2 ultimos digitos).
+
+    Aceita CPF com ou sem mascara, ignora caracteres nao numericos, lida com nulos
+    e valores invalidos retornando None ou a propria string mascarada padrao.
+    """
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    digits = re.sub(r"\D", "", raw)
+
+    # CPFs validos tem 11 digitos. Se for menor, ainda exibimos mascarado,
+    # mas indicamos os 2 ultimos digitos disponiveis. Acima de 11, truncamos.
+    if len(digits) < 2:
+        return "***.***.***-**"
+
+    if len(digits) > 11:
+        digits = digits[-11:]
+
+    last_two = digits[-2:]
+    return f"***.***.***-{last_two}"
+
+
+def _classify_group(value: Any) -> Optional[str]:
+    """Normaliza o valor da coluna 'classificacao' para uma chave canonica de grupo."""
+    if value is None:
+        return None
+    norm = normalize_text(str(value))
+    if not norm:
+        return None
+    if "pos" in norm and "operator" in norm:
+        return "pos_operatorios"
+    if "positivo" in norm:
+        return "positivos"
+    if "provavel" in norm or "provaveis" in norm:
+        return "provaveis"
+    if "negativo" in norm:
+        return "negativos"
+    # Mantem o valor normalizado como bucket extra para nao perder dados.
+    return norm.replace(" ", "_")
 
 
 def _detect_requested_limit(text: str, default_limit: int) -> int:
@@ -367,6 +426,16 @@ def _resolve_query_shape(
     text = normalize_text(query)
     explicit_mode = normalize_text(output_mode or "")
 
+    # Caracterizacao explicita: sempre mixed, sem truncar e com JOIN de CPF.
+    if detect_grouped_lists(query):
+        return {
+            "query_shape": "mixed",
+            "output_mode": "mixed",
+            "limit": 0,
+            "grouped_lists": True,
+            "reason": "Usuario pediu caracterizacao/segregacao de pacientes por grupo clinico.",
+        }
+
     if explicit_mode in {"detail", "detalhe", "detalhado", "sample", "amostra", "lookup"}:
         return {
             "query_shape": "detail",
@@ -435,13 +504,52 @@ def _resolve_query_shape(
     }
 
 
-def _build_query_shape_contract(query_shape: str, output_mode: str, sample_size: int, detail_limit: int) -> str:
-    limit_instruction = f"- Se precisar limitar registros brutos, prefira row_number() em CTE e filtre rn <= {detail_limit}." if detail_limit > 0 else "- Não limite o número de registros retornados, traga todos os resultados solicitados."
-    
+def _build_query_shape_contract(
+    query_shape: str,
+    output_mode: str,
+    sample_size: int,
+    detail_limit: int,
+    grouped_lists: bool = False,
+) -> str:
+    limit_instruction = (
+        f"- Se precisar limitar registros brutos, prefira row_number() em CTE e filtre rn <= {detail_limit}."
+        if detail_limit > 0
+        else "- Não limite o número de registros retornados, traga todos os resultados solicitados."
+    )
+
+    grouped_block = ""
+    if grouped_lists:
+        grouped_block = """
+MODO CARACTERIZACAO DE PACIENTES (obrigatorio neste pedido):
+- O usuario pediu caracterizacao/segregacao de pacientes em grupos clinicos.
+- Voce DEVE gerar uma unica consulta CTE-based que produza linhas individuais (uma linha por paciente x atendimento) com a coluna `classificacao` materializada como string explicita, usando exatamente os rotulos: 'positivo', 'provavel', 'negativo' ou 'pos_operatorio' (em minusculas, sem acento).
+- Os limiares e regras de score que definem cada classificacao devem vir do rag_context (treinamento_ia_catarata). Construa o score em CTEs progressivas (base -> texto_normalizado -> features -> score_calc -> classificado).
+- O SELECT final DEVE incluir EXATAMENTE estas colunas, nesta ordem:
+    id_paciente,
+    nome_paciente,
+    dp.cpf_paciente AS cpf_paciente,
+    id_atendimento,
+    data_atendimento,
+    clinica,
+    regional,
+    nome_profissional,
+    classificacao,
+    score,
+    termo_detectado,
+    trecho_evidencia
+- `termo_detectado` deve ser construido via expressao logica (CASE/COALESCE) que aponta qual termo do rag_context ativou a classificacao.
+- `trecho_evidencia` deve usar regexp_extract sobre o campo narrativo que casou (limite implicito de tamanho controlado em Python; nao trunque no SQL).
+- LEFT JOIN obrigatorio: `LEFT JOIN pdgt_amorsaude_inteligencia.dm_pacientes_amei dp ON dp.id_paciente = fp.id_paciente` para trazer cpf_paciente.
+- Use alias `fp` para `pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia`. NAO adicione filtro de id_especialidade — a tabela ja vem pre-filtrada para oftalmologia.
+- NAO use LIMIT, NAO use SELECT *, NAO use row_number para cortar grupos. Traga TODAS as linhas de TODOS os grupos.
+- Nao filtre por classificacao no SELECT final, exceto se o usuario pediu explicitamente apenas um grupo.
+"""
+
     return f"""
 Preferencia inicial de consulta: {query_shape}
 Modo de saida preferido: {output_mode}
 Limite preferido para linhas detalhadas: {detail_limit if detail_limit > 0 else 'Nenhum'}
+Caracterizacao de pacientes solicitada: {'sim' if grouped_lists else 'nao'}
 
 Use a pergunta do usuario como fonte principal de decisao. Voce pode retornar:
 - aggregate: metricas, totais, percentuais, rankings, recortes ou series temporais.
@@ -456,7 +564,7 @@ Regras de liberdade controlada:
 - Para respostas mistas, separe resumo e detalhes em CTEs e retorne ambos no resultado final.
 {limit_instruction}
 - Nao use LIMIT.
-"""
+{grouped_block}"""
 
 
 # Colunas padrão para substituir SELECT * automaticamente
@@ -498,9 +606,9 @@ def _semantic_validate_sql(sql: str, query_shape: str, original_query: str) -> s
         logger.info("SELECT * substituído por colunas explícitas")
         return corrected
 
-    if "id_especialidade = 661" not in sql_normalized and "id_especialidade=661" not in sql_normalized:
-        raise ValueError("SQL invalido semanticamente: filtro obrigatorio id_especialidade = 661 ausente.")
-
+    # A tabela fl_prontuarios_oftalmologia ja vem filtrada para oftalmologia.
+    # NAO exigimos mais id_especialidade = 661 — e ate desencorajado, para evitar
+    # filtros redundantes que limitem indevidamente os dados.
     return sql
 
 
@@ -514,6 +622,7 @@ async def _generate_sql(
     query_shape: str = "detail",
     detail_limit: int = 20,
     extra_instruction: str = "",
+    grouped_lists: bool = False,
 ) -> str:
     """Usa o LLM para gerar uma query SQL válida para o Athena."""
     period = _extract_period(query, hoje)
@@ -527,6 +636,7 @@ async def _generate_sql(
         output_mode=output_mode,
         sample_size=sample_size,
         detail_limit=detail_limit,
+        grouped_lists=grouped_lists,
     )
 
     llm = get_chat_model_openai(temperature=0.0, model=settings.MODEL_NAME_SQL)
@@ -545,7 +655,7 @@ REGRA MAIS IMPORTANTE:
 
 Contrato de Execução:
 1. Tabela: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia
-2. Filtro fixo obrigatório: id_especialidade = 661{period_filter}
+2. NAO adicione filtro de id_especialidade — a tabela ja vem pre-filtrada para oftalmologia.{period_filter}
 4. output_mode preferido: '{output_mode}'
 5. query_shape preferido: '{query_shape}'
 
@@ -601,6 +711,7 @@ async def _repair_sql_for_semantics(
     hoje: str,
     query_shape: str,
     detail_limit: int,
+    grouped_lists: bool = False,
 ) -> str:
     extra_instruction = f"""
 O SQL anterior foi rejeitado pela validação semântica:
@@ -623,6 +734,7 @@ Regenere a consulta do zero. NUNCA use SELECT * — liste as colunas explícitas
         query_shape=query_shape,
         detail_limit=detail_limit,
         extra_instruction=extra_instruction,
+        grouped_lists=grouped_lists,
     )
 
 
@@ -651,6 +763,7 @@ async def _repair_sql_for_execution(
     output_mode: str,
     sample_size: int,
     detail_limit: int,
+    grouped_lists: bool = False,
 ) -> str:
     """Tenta corrigir SQL que falhou na execução do Athena."""
     llm = get_chat_model_openai(temperature=0.0, model=settings.MODEL_NAME_SQL)
@@ -660,6 +773,7 @@ async def _repair_sql_for_execution(
         output_mode=output_mode,
         sample_size=sample_size,
         detail_limit=detail_limit,
+        grouped_lists=grouped_lists,
     )
 
     fix_prompt = f"""O SQL abaixo causou erro no AWS Athena/Presto.
@@ -701,12 +815,20 @@ Regras obrigatorias:
 def _compact_detail_row(row: dict) -> dict:
     safe_row = _make_json_safe(row)
 
+    raw_cpf = (
+        row.get("cpf_paciente")
+        or row.get("cpf")
+        or row.get("num_cpf")
+    )
+    masked_cpf = _mask_cpf(raw_cpf)
+
     return {
         "estrato": row.get("estrato") or row.get("classificacao") or row.get("classe"),
         "classificacao": row.get("classificacao") or row.get("estrato") or row.get("classe"),
         "id_atendimento": row.get("id_atendimento"),
         "id_paciente": row.get("id_paciente"),
         "nome_paciente": row.get("nome_paciente"),
+        "cpf_paciente": masked_cpf,
         "data_atendimento": _make_json_safe(row.get("data_atendimento")),
         "campo_origem": row.get("campo_origem") or row.get("campo"),
         "termo_detectado": row.get("termo_detectado") or row.get("termo"),
@@ -725,20 +847,58 @@ def _compact_detail_row(row: dict) -> dict:
     }
 
 
+def _group_rows_by_classification(rows: list[dict]) -> dict:
+    """Agrupa linhas por classificacao clinica canonica.
+
+    Retorna um dict com chaves estaveis para os 4 grupos principais
+    (positivos, provaveis, negativos, pos_operatorios) sempre presentes
+    como lista (possivelmente vazia), mais quaisquer buckets extras
+    encontrados no resultado.
+    """
+    buckets: dict[str, list] = {
+        "positivos": [],
+        "provaveis": [],
+        "negativos": [],
+        "pos_operatorios": [],
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        group = _classify_group(
+            row.get("classificacao")
+            or row.get("estrato")
+            or row.get("classe")
+        )
+        if not group:
+            buckets.setdefault("nao_classificados", []).append(row)
+            continue
+        buckets.setdefault(group, []).append(row)
+    return buckets
+
+
 def _format_sql_result(
     results: list[dict],
     output_mode: str,
     sample_size: int,
     query_shape: str = "detail",
     detail_limit: int = 20,
+    grouped_lists: bool = False,
 ) -> dict:
-    """Formata o retorno preservando dados brutos sempre que existirem."""
+    """Formata o retorno preservando dados brutos sempre que existirem.
+
+    Quando grouped_lists=True, NUNCA trunca e produz `grouped_rows` agregando
+    `rows` por classificacao clinica canonica, alem de `summary` com totais
+    por grupo. CPF aparece sempre mascarado.
+    """
     if not results:
         return {
             "execution_status": "success",
             "summary": {},
             "rows": [],
             "raw_rows": [],
+            "grouped_rows": {} if not grouped_lists else {
+                "positivos": [], "provaveis": [], "negativos": [], "pos_operatorios": [],
+            },
             "row_count": 0,
             "total_rows_returned_by_athena": 0,
             "truncated": False,
@@ -746,9 +906,12 @@ def _format_sql_result(
             "limitations": ["Nenhum registro encontrado para os criterios informados."],
         }
 
-    max_rows = detail_limit if detail_limit > 0 else 0
-    if query_shape == "aggregate" and output_mode == "summary":
+    if grouped_lists:
+        max_rows = 0  # caracterizacao nunca trunca
+    elif query_shape == "aggregate" and output_mode == "summary":
         max_rows = 0
+    else:
+        max_rows = detail_limit if detail_limit > 0 else 0
 
     if max_rows > 0:
         rows_to_return = results[:max_rows]
@@ -756,7 +919,49 @@ def _format_sql_result(
         rows_to_return = results
 
     truncated = len(results) > len(rows_to_return)
+
+    if grouped_lists:
+        # Caracterizacao: compactamos cada linha (mascara CPF, normaliza campos) e
+        # agrupamos por classificacao. raw_rows preserva o registro original para auditoria,
+        # mas o orquestrador deve usar grouped_rows.
+        compact_rows = [_compact_detail_row(row) for row in rows_to_return]
+        grouped = _group_rows_by_classification(compact_rows)
+        safe_raw = [_make_json_safe(row) for row in rows_to_return]
+        # Remove cpf cru de raw_rows para nao vazar CPF nao mascarado no log/judge.
+        for r in safe_raw:
+            if isinstance(r, dict) and "cpf_paciente" in r:
+                r["cpf_paciente"] = _mask_cpf(r.get("cpf_paciente"))
+        payload = {
+            "execution_status": "success",
+            "summary": {},
+            "rows": compact_rows,
+            "raw_rows": safe_raw,
+            "grouped_rows": grouped,
+            "group_counts": {k: len(v) for k, v in grouped.items()},
+            "row_count": len(compact_rows),
+            "total_rows_returned_by_athena": len(results),
+            "truncated": False,
+            "error": None,
+            "limitations": [],
+        }
+        payload["summary"] = {
+            "total_registros": len(results),
+            "total_pacientes_unicos": len({
+                r.get("id_paciente") for r in results if r.get("id_paciente") is not None
+            }) or None,
+            "positivos": len(grouped.get("positivos", [])),
+            "provaveis": len(grouped.get("provaveis", [])),
+            "negativos": len(grouped.get("negativos", [])),
+            "pos_operatorios": len(grouped.get("pos_operatorios", [])),
+        }
+        return payload
+
     safe_rows = [_make_json_safe(row) for row in rows_to_return]
+    # Mesmo fora de caracterizacao, se cpf_paciente aparecer (algum outro modo
+    # detalhado), mascaramos antes de devolver para o agente/judge.
+    for r in safe_rows:
+        if isinstance(r, dict) and "cpf_paciente" in r:
+            r["cpf_paciente"] = _mask_cpf(r.get("cpf_paciente"))
 
     payload = {
         "execution_status": "success",
@@ -780,7 +985,7 @@ async def _execute_query(sql: str) -> list[dict[str, Any]]:
     """Execute SQL via query_athena_tool com tracing."""
     result_str = await query_athena_tool.ainvoke({"sql": sql})
 
-    if result_str.startswith("Consulta inválida") or result_str.startswith("Erro ao acessar"):
+    if result_str.startswith("Consulta invalida") or result_str.startswith("Erro ao acessar"):
         raise ValueError(result_str)
 
     if result_str in ("Nenhum resultado encontrado para esta consulta.", ""):
@@ -790,7 +995,7 @@ async def _execute_query(sql: str) -> list[dict[str, Any]]:
         return json.loads(result_str)
     except (json.JSONDecodeError, TypeError) as e:
         logger.error(f"Falha ao parsear resultado da tool: {e}")
-        raise ValueError(f"Resultado inválido da ferramenta Athena: {result_str[:200]}")
+        raise ValueError(f"Resultado invalido da ferramenta Athena: {result_str[:200]}")
 
 
 @traceable(name="sql_analyst_expert", as_type="chain")
@@ -801,13 +1006,7 @@ async def sql_analyst_expert(
     sample_size: int = 5,
     hoje: str = "",
 ) -> dict:
-    """
-    Especialista SQL para o sistema Iris.
-
-    Gera, valida e executa uma query Athena, retornando payload estruturado.
-    Em caso de falha de execução, tenta corrigir o SQL automaticamente
-    (até 3 tentativas no total).
-    """
+    """Especialista SQL para o sistema Iris."""
     hoje = hoje or date.today().strftime("%Y-%m-%d")
 
     intent = _resolve_query_shape(
@@ -818,7 +1017,8 @@ async def sql_analyst_expert(
 
     query_shape = intent["query_shape"]
     resolved_output_mode = intent["output_mode"]
-    detail_limit = intent["limit"] or 20
+    grouped_lists = bool(intent.get("grouped_lists"))
+    detail_limit = 0 if grouped_lists else (intent["limit"] or 20)
 
     logger.info(
         "SQL Analyst Expert iniciado | "
@@ -826,6 +1026,7 @@ async def sql_analyst_expert(
         f"output_mode={resolved_output_mode} | "
         f"sample_size={sample_size} | "
         f"detail_limit={detail_limit} | "
+        f"grouped_lists={grouped_lists} | "
         f"reason={intent.get('reason')}"
     )
 
@@ -838,6 +1039,7 @@ async def sql_analyst_expert(
             hoje=hoje,
             query_shape=query_shape,
             detail_limit=detail_limit,
+            grouped_lists=grouped_lists,
         )
 
         logger.info(f"SQL gerado:\n{sql}")
@@ -845,7 +1047,7 @@ async def sql_analyst_expert(
         try:
             sql = _semantic_validate_sql(sql, query_shape, query)
         except ValueError as semantic_error:
-            logger.warning(f"SQL rejeitado por validação semântica: {semantic_error}")
+            logger.warning(f"SQL rejeitado por validacao semantica: {semantic_error}")
 
             sql = await _repair_sql_for_semantics(
                 original_sql=sql,
@@ -857,14 +1059,15 @@ async def sql_analyst_expert(
                 hoje=hoje,
                 query_shape=query_shape,
                 detail_limit=detail_limit,
+                grouped_lists=grouped_lists,
             )
 
-            logger.info(f"SQL regenerado após validação semântica:\n{sql}")
+            logger.info(f"SQL regenerado apos validacao semantica:\n{sql}")
 
             try:
                 sql = _semantic_validate_sql(sql, query_shape, query)
             except ValueError as e:
-                logger.error(f"Repair também falhou validação semântica: {e}")
+                logger.error(f"Repair tambem falhou validacao semantica: {e}")
 
                 return {
                     "execution_status": "error",
@@ -879,7 +1082,7 @@ async def sql_analyst_expert(
                     "query_shape": query_shape,
                     "output_mode": resolved_output_mode,
                     "intent_reason": intent.get("reason"),
-                    "limitations": [f"Repair semântico falhou: {e}"],
+                    "limitations": [f"Repair semantico falhou: {e}"],
                 }
 
     except Exception as e:
@@ -901,7 +1104,7 @@ async def sql_analyst_expert(
     try:
         validate_sql(sql)
     except ValueError as e:
-        logger.warning(f"SQL inválido: {e}")
+        logger.warning(f"SQL invalido: {e}")
 
         return {
             "execution_status": "error",
@@ -933,11 +1136,13 @@ async def sql_analyst_expert(
                 sample_size=sample_size,
                 query_shape=query_shape,
                 detail_limit=detail_limit,
+                grouped_lists=grouped_lists,
             )
 
             payload["sql"] = current_sql
             payload["query_shape"] = query_shape
             payload["output_mode"] = resolved_output_mode
+            payload["grouped_lists"] = grouped_lists
             payload["intent_reason"] = intent.get("reason")
 
             if attempt > 0:
@@ -946,7 +1151,7 @@ async def sql_analyst_expert(
                 ]
 
             logger.info(
-                "SQL Analyst: Execução bem-sucedida | "
+                "SQL Analyst: Execucao bem-sucedida | "
                 f"query_shape={query_shape} | "
                 f"row_count={payload.get('row_count')} | "
                 f"tentativa={attempt + 1}"
@@ -970,17 +1175,13 @@ async def sql_analyst_expert(
                     output_mode=resolved_output_mode,
                     sample_size=sample_size,
                     detail_limit=detail_limit,
+                    grouped_lists=grouped_lists,
                 )
                 try:
                     current_sql = _semantic_validate_sql(current_sql, query_shape, query)
                     validate_sql(current_sql)
                 except ValueError as ve:
-                    logger.warning(f"SQL regenerado continuou inválido: {ve}")
-                    # A próxima iteração vai falhar ou será que passamos o erro? 
-                    # Deixamos tentar a próxima iteração com o SQL problemático, 
-                    # ou podemos colocar um 'continue' se fosse no try. Como estamos 
-                    # no final do except, o loop 'for attempt' vai naturalmente 
-                    # rodar a próxima iteração e bater no _execute_query que pode falhar.
+                    logger.warning(f"SQL regenerado continuou invalido: {ve}")
 
     logger.error(f"SQL Analyst: Todas as {max_attempts} tentativas falharam")
 
@@ -988,7 +1189,7 @@ async def sql_analyst_expert(
         "execution_status": "error",
         "error": {
             "type": "sql_executor_error",
-            "message": f"Todas as {max_attempts} tentativas falharam. Último erro: {last_error}",
+            "message": f"Todas as {max_attempts} tentativas falharam. Ultimo erro: {last_error}",
         },
         "summary": {},
         "rows": [],
@@ -998,6 +1199,6 @@ async def sql_analyst_expert(
         "output_mode": resolved_output_mode,
         "intent_reason": intent.get("reason"),
         "limitations": [
-            "Execução SQL falhou mesmo após tentativa de autocorreção."
+            "Execucao SQL falhou mesmo apos tentativa de autocorrecao."
         ],
-    }
+    }

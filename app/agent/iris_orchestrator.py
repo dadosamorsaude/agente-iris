@@ -50,8 +50,16 @@ Você tem ferramentas à sua disposição para:
 1. Fidelidade Numérica Absoluta: Transcreva os números gerados pela ferramenta SQL exatamente como foram retornados no banco de dados. Nunca arredonde, altere, resuma ou estime valores (por exemplo, se o resultado for 42, escreva '42', nunca 'cerca de 40' ou 'mais de 40').
 2. Especificação da Métrica de Contagem: Sempre especifique e diferencie com clareza o número total de "atendimentos/consultas" e o número de "pacientes únicos" (por exemplo, 'X atendimentos referentes a Y pacientes únicos').
 3. Menção de Período Temporal: Sempre informe claramente ao usuário qual o período de data_atendimento que foi considerado na contagem gerada (por exemplo, 'no período de DD/MM/AAAA a DD/MM/AAAA'), garantindo rastreabilidade e integridade.
-4. Identificadores Reais: Exiba apenas identificadores reais de pacientes (id_paciente e nome_paciente) e atendimentos (id_atendimento) conforme retornados pela consulta SQL. É expressamente proibido alucinar CPFs ou IDs fictícios.
+4. Identificadores Reais: Exiba apenas identificadores reais de pacientes (id_paciente, nome_paciente, cpf_paciente) e atendimentos (id_atendimento) conforme retornados pela consulta SQL. É expressamente proibido alucinar CPFs ou IDs fictícios.
 5. Consistência de Filtros em Histórico: Ao processar perguntas consecutivas dentro de uma mesma sessão, verifique o histórico para manter a consistência temporal (filtros de data) e outros filtros aplicados anteriormente (clínica, profissional), a menos que o usuário peça explicitamente para alterá-los.
+
+## Modo Caracterização de Pacientes
+Quando a tool SQL retornar `grouped_lists: true` e/ou `grouped_rows` populado:
+1. A resposta DEVE conter (i) um resumo agregado com os totais por classificação clínica (positivos, prováveis, negativos, pós-operatórios) e (ii) a LISTA COMPLETA de pacientes de CADA grupo presente em `grouped_rows`. NUNCA omita pacientes nem trunque grupos sob argumento de tamanho.
+2. Para cada paciente listado, mostre obrigatoriamente: id_paciente, nome_paciente, cpf_paciente, id_atendimento, data_atendimento, clinica, regional, nome_profissional, score, termo_detectado e trecho_evidencia.
+3. CPF DEVE ser exibido exatamente como entregue pela tool (formato mascarado `***.***.***-XX`). É proibido reconstituir, inferir ou exibir o CPF completo, mesmo se você o vir em outro campo.
+4. Organize a resposta por grupo (uma seção por classificação), com o total do grupo no cabeçalho e a lista de pacientes em seguida.
+5. Se um grupo estiver vazio, declare explicitamente "Nenhum paciente nesta classificação para o período/critério".
 """
 
 def extract_text_from_content(content: Any) -> str:
@@ -129,8 +137,23 @@ async def run_iris_agent(
     # Histórico
     history_messages = await get_session_history(effective_session)
 
+    # Injeta a data atual no system prompt: sem isso, o LLM responde com a data
+    # da memoria de treinamento (ex.: "2025"). Mantemos o template como constante
+    # e prefixamos o contexto temporal por execucao.
+    hoje_dt = date.today()
+    hoje_br = hoje_dt.strftime("%d/%m/%Y")
+    runtime_prompt = (
+        f"## Contexto Temporal (autoritativo)\n"
+        f"- Data atual: {hoje_br} (ISO: {hoje}).\n"
+        f"- Quando o usuario perguntar a data, ano ou periodo atual, responda EXATAMENTE com base nesta data. "
+        f"Nao use a data da sua memoria de treinamento.\n"
+        f"- Ao interpretar termos relativos (hoje, ontem, este mes, mes passado, ultimos N dias), "
+        f"calcule a partir de {hoje_br}.\n\n"
+        f"{IRIS_SYSTEM_PROMPT}"
+    )
+
     llm = get_chat_model_claude()
-    react_agent = create_react_agent(llm, tools=tools, prompt=IRIS_SYSTEM_PROMPT)
+    react_agent = create_react_agent(llm, tools=tools, prompt=runtime_prompt)
 
     messages = history_messages + [HumanMessage(content=message)]
 

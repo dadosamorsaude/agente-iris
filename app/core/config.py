@@ -2,26 +2,27 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional
 
 
 class Settings(BaseSettings):
     # LLM Settings
     OPENAI_API_KEY: str
-    MODEL_NAME: str = "gpt-5.5"          # Avaliador (LLM-as-Judge) + Auditoria de Performance
-    MODEL_NAME_SQL: str = "gpt-5.4-mini" # Gerador de SQL Athena (tarefa determinística e bem-definida)
+    MODEL_NAME: str = "gpt-5.5"
+    MODEL_NAME_SQL: str = "gpt-5.4-mini"
     TEMPERATURE: float = 0.0
 
     ANTHROPIC_API_KEY: str
-    MODEL_CLAUDE: str =  "claude-sonnet-4-6"
+    MODEL_CLAUDE: str = "claude-sonnet-4-6"
     TEMPERATURE_CLAUDE: float = 0.4
 
     # AWS / Athena Settings
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
     AWS_REGION: str
-    ATHENA_DATABASE: str        # schema/database name (ex: pdgt_amorsaude_inteligencia)
-    ATHENA_S3_STAGING_DIR: str  # s3://bucket/path/ (ex: s3://meu-bucket/athena-results/)
+    ATHENA_DATABASE: str
+    ATHENA_S3_STAGING_DIR: str
+    ATHENA_MAX_ROWS: Optional[int] = None
 
     # Pinecone Settings
     PINECONE_API_KEY: Optional[str] = None
@@ -34,12 +35,12 @@ class Settings(BaseSettings):
     # Security
     AGENTE_API_KEY: str
     ALLOWED_ORIGINS: str
-    
-    # Memory — PostgreSQL (Optional, falls back to in-memory if not set)
-    DATABASE_URL: Optional[str] = None  # postgresql://user:password@host:5432/dbname
+
+    # Memory
+    DATABASE_URL: Optional[str] = None
     DATABASE_API_KEY: Optional[str] = None
 
-    # Observability - Langfuse
+    # Observability
     LANGFUSE_SECRET_KEY: Optional[str] = None
     LANGFUSE_PUBLIC_KEY: Optional[str] = None
     LANGFUSE_BASE_URL: Optional[str] = None
