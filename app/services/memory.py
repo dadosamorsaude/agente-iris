@@ -29,7 +29,7 @@ async def ensure_tables(pool: asyncpg.Pool) -> None:
         return
     async with pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS chat_history (
+            CREATE TABLE IF NOT EXISTS chat_history_iris (
                 id SERIAL PRIMARY KEY,
                 session_id UUID NOT NULL,
                 message JSONB NOT NULL,
@@ -37,11 +37,11 @@ async def ensure_tables(pool: asyncpg.Pool) -> None:
             )
         """)
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chat_history_session
-            ON chat_history (session_id)
+            CREATE INDEX IF NOT EXISTS idx_chat_history_session_iris
+            ON chat_history_iris (session_id)
         """)
     _tables_created = True
-    logger.info("Tabela 'chat_history' verificada/criada com sucesso (asyncpg).")
+    logger.info("Tabela 'chat_history_iris' verificada/criada com sucesso (asyncpg).")
 
 
 async def get_pool() -> Optional[asyncpg.Pool]:
@@ -77,7 +77,7 @@ async def get_session_history(session_id: str, max_messages: int = 8) -> list[Ba
             if _pool:
                 async with _pool.acquire() as conn:
                     rows = await conn.fetch(
-                        """SELECT message FROM chat_history
+                        """SELECT message FROM chat_history_iris
                            WHERE session_id = $1
                            ORDER BY created_at ASC
                            LIMIT $2""",
@@ -115,7 +115,7 @@ async def add_message(session_id: str, message: BaseMessage) -> None:
             if _pool:
                 async with _pool.acquire() as conn:
                     await conn.execute(
-                        "INSERT INTO chat_history (session_id, message) VALUES ($1, $2::jsonb)",
+                        "INSERT INTO chat_history_iris (session_id, message) VALUES ($1, $2::jsonb)",
                         valid_session_id, msg_data
                     )
                 return
@@ -147,7 +147,7 @@ async def clear_session_history(session_id: str) -> None:
             if _pool:
                 async with _pool.acquire() as conn:
                     await conn.execute(
-                        "DELETE FROM chat_history WHERE session_id = $1",
+                        "DELETE FROM chat_history_iris WHERE session_id = $1",
                         valid_session_id
                     )
                 return

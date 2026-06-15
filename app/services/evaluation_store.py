@@ -64,7 +64,7 @@ async def save_evaluation(
 
     if settings.supabase_rest_url and settings.DATABASE_API_KEY:
         try:
-            url = f"{settings.supabase_rest_url}evaluation_logs"
+            url = f"{settings.supabase_rest_url}evaluation_logs_iris"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(url, headers=_get_headers(), json=record)
                 resp.raise_for_status()
@@ -159,7 +159,7 @@ async def get_evaluation_summary() -> dict:
     """Retorna o resumo agregado de todas as avaliações."""
     if settings.supabase_rest_url and settings.DATABASE_API_KEY:
         try:
-            url = f"{settings.supabase_rest_url}evaluation_logs?select=score,approved,created_at,errors"
+            url = f"{settings.supabase_rest_url}evaluation_logs_iris?select=score,approved,created_at,errors"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url, headers=_get_headers())
                 resp.raise_for_status()
@@ -209,7 +209,7 @@ async def get_evaluation_history(limit: int = 20) -> list[dict]:
     """Retorna as últimas avaliações via REST."""
     if settings.supabase_rest_url and settings.DATABASE_API_KEY:
         try:
-            url = f"{settings.supabase_rest_url}evaluation_logs?order=created_at.desc&limit={limit}"
+            url = f"{settings.supabase_rest_url}evaluation_logs_iris?order=created_at.desc&limit={limit}"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url, headers=_get_headers())
                 resp.raise_for_status()

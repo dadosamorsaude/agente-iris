@@ -40,6 +40,16 @@ async def chat_endpoint(
             if cached_response:
                 text = cached_response.get("response")
                 yield f"data: {json.dumps({'content': text}, ensure_ascii=False)}\n\n"
+                
+                # Executa extração estruturada de CPF/Caso Clínico para o cache
+                try:
+                    from app.services.extractor import extract_clinical_analysis
+                    result_data = await extract_clinical_analysis(req.message, text)
+                    if result_data:
+                        yield f"data: {json.dumps({'result': result_data}, ensure_ascii=False)}\n\n"
+                except Exception as ex:
+                    logger.error(f"Erro ao extrair dados do cache: {ex}")
+
                 yield "data: [DONE]\n\n"
                 return
 
@@ -56,6 +66,16 @@ async def chat_endpoint(
                         continue
                     full_stream_response += chunk
                     yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+
+                # No final do stream, executa a extração estruturada (CPF, classificação, etc)
+                if full_stream_response:
+                    try:
+                        from app.services.extractor import extract_clinical_analysis
+                        result_data = await extract_clinical_analysis(req.message, full_stream_response)
+                        if result_data:
+                            yield f"data: {json.dumps({'result': result_data}, ensure_ascii=False)}\n\n"
+                    except Exception as ex:
+                        logger.error(f"Erro ao extrair análise estruturada clínica no stream: {ex}")
 
                 yield "data: [DONE]\n\n"
 
@@ -85,7 +105,10 @@ async def chat_endpoint(
     try:
         if cached_response:
             text = cached_response.get("response")
-            return {"response": text}
+            # Extrai o result
+            from app.services.extractor import extract_clinical_analysis
+            result_data = await extract_clinical_analysis(req.message, text)
+            return {"response": text, "result": result_data}
 
         chunks = []
         async for chunk in run_iris_agent(
@@ -106,8 +129,11 @@ async def chat_endpoint(
             req.message, full_text, raw_athena, raw_rag
         )
 
-        return {"response": full_text}
+        from app.services.extractor import extract_clinical_analysis
+        result_data = await extract_clinical_analysis(req.message, full_text)
+        return {"response": full_text, "result": result_data}
 
     except Exception as e:
         logger.exception("Error in /api/v1/iris/chat")
         return {"response": "", "error": str(e)}
+
