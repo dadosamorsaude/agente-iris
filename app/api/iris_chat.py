@@ -25,6 +25,15 @@ class IrisChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class ReportRequest(BaseModel):
+    period: str = Field(default="mes_atual", description="Período do relatório")
+    stratification: str = Field(default="todos", description="Filtro de classificação/estratificação")
+    laterality: str = Field(default="todos", description="Filtro de lateralidade")
+    start_date: Optional[str] = Field(default=None, description="Data de início (opcional)")
+    end_date: Optional[str] = Field(default=None, description="Data de fim (opcional)")
+    clinic: Optional[str] = Field(default=None, description="Filtro de clínica (opcional)")
+
+
 @router.post("/chat")
 async def chat_endpoint(
     req: IrisChatRequest,
@@ -138,13 +147,9 @@ async def chat_endpoint(
         return {"response": "", "error": str(e)}
 
 
-@router.get("/report")
+@router.post("/report")
 async def report_endpoint(
-    period: str = "mes_atual",
-    stratification: str = "todos",
-    laterality: str = "todos",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+    req: ReportRequest,
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -152,7 +157,19 @@ async def report_endpoint(
     Retorna os dados dos pacientes com base nos filtros selecionados.
     """
     import datetime
-    logger.info(f"Requisição GET /report | period={period} | stratification={stratification} | laterality={laterality} | start_date={start_date} | end_date={end_date}")
+    from fastapi import HTTPException
+    
+    period = req.period
+    stratification = req.stratification
+    laterality = req.laterality
+    start_date = req.start_date
+    end_date = req.end_date
+    clinic = req.clinic
+    
+    logger.info(f"Requisição POST /report | period={period} | stratification={stratification} | laterality={laterality} | start_date={start_date} | end_date={end_date} | clinic={clinic}")
+    
+    if clinic and len(clinic) > 200:
+        raise HTTPException(status_code=400, detail="O nome da clínica deve ter no máximo 200 caracteres.")
     
     # 1. Determina as datas do período
     def calculate_dates(p: str) -> tuple[Optional[str], Optional[str]]:
@@ -286,6 +303,14 @@ async def report_endpoint(
             else:
                 filtered_rows = [r for r in filtered_rows if r.get("lateralidade") == filter_lat]
 
+        # Filtro de clínica (case-insensitive substring match)
+        if clinic:
+            clinic_normalized = clinic.lower().strip()
+            filtered_rows = [
+                r for r in filtered_rows
+                if r.get("clinica") and clinic_normalized in str(r.get("clinica")).lower()
+            ]
+
         # 8. Calcula o resumo para as linhas filtradas
         filtered_summary = compute_summary_stats(filtered_rows)
 
@@ -295,7 +320,15 @@ async def report_endpoint(
             "filtered_summary": filtered_summary,
             "rows": filtered_rows,
             "sql": result.get("sql"),
-            "limitations": result.get("limitations", [])
+            "limitations": result.get("limitations", []),
+            "filters_applied": {
+                "period": period,
+                "stratification": stratification,
+                "laterality": laterality,
+                "start_date": start_date,
+                "end_date": end_date,
+                "clinic": clinic
+            }
         }
 
     except Exception as e:
@@ -307,6 +340,65 @@ async def report_endpoint(
             "filtered_summary": {},
             "rows": [],
             "sql": None,
-            "limitations": [str(e)]
+            "limitations": [str(e)],
+            "filters_applied": {
+                "period": period,
+                "stratification": stratification,
+                "laterality": laterality,
+                "start_date": start_date,
+                "end_date": end_date,
+                "clinic": clinic
+            }
         }
+
+
+# Cache global para a lista de clínicas
+_clinics_cache = {
+    "data": None,
+    "timestamp": 0
+}
+CLINICS_CACHE_TTL = 300  # 5 minutos
+
+@router.get("/clinics")
+async def clinics_endpoint(
+    api_key: str = Depends(get_api_key),
+):
+    """
+    Retorna a lista distinta de clínicas disponíveis na base, ordenada alfabeticamente (pt-BR).
+    Utiliza um cache em memória de 5 minutos.
+    """
+    import time
+    import unicodedata
+    import asyncio
+    
+    now = time.time()
+    if _clinics_cache["data"] is not None and now - _clinics_cache["timestamp"] < CLINICS_CACHE_TTL:
+        logger.info("Retornando lista de clínicas do cache.")
+        return {"success": True, "clinics": _clinics_cache["data"]}
+
+    logger.info("Buscando lista de clínicas no Athena...")
+    sql = "SELECT DISTINCT clinica FROM pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia WHERE clinica IS NOT NULL AND clinica <> ''"
+    
+    try:
+        from app.tools.athena import _execute_traced
+        results = await asyncio.to_thread(_execute_traced, sql)
+        
+        raw_clinics = [row["clinica"] for row in results if "clinica" in row and row["clinica"]]
+        
+        # Ordenação pt-BR (ignora acentos ao ordenar de forma case-insensitive)
+        def pt_br_sort_key(s: str) -> str:
+            normalized = unicodedata.normalize('NFD', s)
+            return "".join(c for c in normalized if unicodedata.category(c) != 'Mn').lower()
+            
+        sorted_clinics = sorted(list(set(raw_clinics)), key=pt_br_sort_key)
+        
+        # Salva no cache
+        _clinics_cache["data"] = sorted_clinics
+        _clinics_cache["timestamp"] = now
+        
+        return {"success": True, "clinics": sorted_clinics}
+        
+    except Exception as e:
+        logger.exception("Erro ao buscar clínicas")
+        return {"success": False, "clinics": [], "error": str(e)}
 

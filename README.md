@@ -35,6 +35,44 @@ Agente de IA especializado em análise de prontuários médicos e conformidade c
    uv run uvicorn app.main:app --reload
    ```
 
+## 🔗 Endpoints Auxiliares e Relatórios
+
+### 1. `POST /api/v1/iris/report`
+Gera o relatório estruturado para análise de cirurgias de catarata a partir do AWS Athena e RAG clínico.
+
+**Request Body:**
+```json
+{
+  "period": "mes_atual",
+  "stratification": "todos",
+  "laterality": "todos",
+  "clinic": "Juazeiro"
+}
+```
+*   `clinic` (opcional): Filtro de substring case-insensitive para clínicas (máx. 200 caracteres).
+*   `period` (opcional): `"hoje" | "ontem" | "ultimos_7_dias" | "ultimos_30_dias" | "mes_atual" | "mes_passado" | "todo_historico"`.
+
+**Response:**
+Retorna o resumo estatístico geral, resumo filtrado e lista de pacientes contendo os campos de CPF completo formatado, lateralidade e clínica, além do campo `"filters_applied"` contendo o eco de auditoria dos filtros.
+
+---
+
+### 2. `GET /api/v1/iris/clinics`
+Retorna a lista distinta de todas as clínicas ativas na base de dados de oftalmologia, ordenadas alfabeticamente (pt-BR, ignorando acentuações). Possui cache interno de 5 minutos.
+
+**Response:**
+```json
+{
+  "success": true,
+  "clinics": [
+    "Abaetetuba",
+    "Aracaju",
+    "Belém",
+    "São Paulo"
+  ]
+}
+```
+
 ## 🌐 Deploy no Render
 
 Este repositório contém um arquivo `render.yaml`. Para subir no Render:
