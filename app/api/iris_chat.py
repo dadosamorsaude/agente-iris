@@ -137,3 +137,166 @@ async def chat_endpoint(
         logger.exception("Error in /api/v1/iris/chat")
         return {"response": "", "error": str(e)}
 
+
+@router.get("/report")
+async def report_endpoint(
+    period: str = "mes_atual",
+    stratification: str = "todos",
+    laterality: str = "todos",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    api_key: str = Depends(get_api_key),
+):
+    """
+    Endpoint de relatório estruturado para análise de cirurgias de catarata.
+    Retorna os dados dos pacientes com base nos filtros selecionados.
+    """
+    import datetime
+    logger.info(f"Requisição GET /report | period={period} | stratification={stratification} | laterality={laterality} | start_date={start_date} | end_date={end_date}")
+    
+    # 1. Determina as datas do período
+    def calculate_dates(p: str) -> tuple[Optional[str], Optional[str]]:
+        today = datetime.date.today()
+        if p == "hoje":
+            return today.isoformat(), today.isoformat()
+        elif p == "ontem":
+            yesterday = today - datetime.timedelta(days=1)
+            return yesterday.isoformat(), yesterday.isoformat()
+        elif p == "ultimos_7_dias":
+            start = today - datetime.timedelta(days=6)
+            return start.isoformat(), today.isoformat()
+        elif p == "ultimos_30_dias":
+            start = today - datetime.timedelta(days=29)
+            return start.isoformat(), today.isoformat()
+        elif p == "mes_atual":
+            start = today.replace(day=1)
+            return start.isoformat(), today.isoformat()
+        elif p == "mes_passado":
+            first_this = today.replace(day=1)
+            last_prev = first_this - datetime.timedelta(days=1)
+            first_prev = last_prev.replace(day=1)
+            return first_prev.isoformat(), last_prev.isoformat()
+        elif p == "todo_historico":
+            return None, None
+        return None, None
+
+    if start_date or end_date:
+        start_date_str = start_date
+        end_date_str = end_date
+    else:
+        start_date_str, end_date_str = calculate_dates(period)
+
+    # 2. Constrói o texto do período
+    if start_date_str and end_date_str:
+        period_text = f"de {start_date_str} ate {end_date_str}"
+    elif start_date_str:
+        period_text = f"a partir de {start_date_str}"
+    elif end_date_str:
+        period_text = f"ate {end_date_str}"
+    else:
+        period_text = "de todo o historico sem filtro de periodo"
+
+    # 3. Constrói a query para o SQL analyst
+    query_text = f"caracterizacao dos pacientes por classificacao clinica {period_text}"
+
+    try:
+        # 4. Obtém o contexto clínico (RAG)
+        from app.agent.specialists.clinical_rag import clinical_rag_expert
+        rag_json_str = await clinical_rag_expert("diretrizes de catarata")
+        try:
+            rag_data = json.loads(rag_json_str)
+            rag_context = rag_data.get("rag_context", rag_json_str)
+        except Exception:
+            rag_context = rag_json_str
+
+        # 5. Executa a análise SQL Athena
+        from app.agent.specialists.sql_analyst import sql_analyst_expert
+        result = await sql_analyst_expert(
+            query=query_text,
+            rag_context=rag_context,
+            hoje=datetime.date.today().isoformat()
+        )
+
+        if result.get("execution_status") == "error":
+            logger.error(f"Erro ao executar relatório no Athena: {result.get('error')}")
+            return {
+                "success": False,
+                "error": result.get("error", {}).get("message", "Erro desconhecido na consulta SQL"),
+                "summary": {},
+                "filtered_summary": {},
+                "rows": [],
+                "sql": result.get("sql"),
+                "limitations": result.get("limitations", [])
+            }
+
+        all_rows = result.get("rows", [])
+        
+        # 6. Calcula o resumo geral (overall summary) do período
+        # Classificações possíveis: positivos, provaveis, negativos, pos_operatorios
+        def compute_summary_stats(rows_list: list[dict]) -> dict:
+            total = len(rows_list)
+            positivos = sum(1 for r in rows_list if r.get("classificacao") == "positivo")
+            provaveis = sum(1 for r in rows_list if r.get("classificacao") == "provavel")
+            negativos = sum(1 for r in rows_list if r.get("classificacao") == "negativo")
+            pos_op = sum(1 for r in rows_list if r.get("classificacao") == "pos_operatorio")
+            
+            # Contagem de pacientes únicos
+            pacientes_unicos = len({r.get("id_paciente") for r in rows_list if r.get("id_paciente") is not None})
+            
+            return {
+                "total_registros": total,
+                "total_pacientes_unicos": pacientes_unicos,
+                "positivos": positivos,
+                "provaveis": provaveis,
+                "negativos": negativos,
+                "pos_operatorios": pos_op,
+                "percentual_positivos": round(positivos / total * 100, 2) if total > 0 else 0,
+                "percentual_provaveis": round(provaveis / total * 100, 2) if total > 0 else 0,
+                "percentual_negativos": round(negativos / total * 100, 2) if total > 0 else 0,
+                "percentual_pos_operatorios": round(pos_op / total * 100, 2) if total > 0 else 0
+            }
+
+        overall_summary = compute_summary_stats(all_rows)
+
+        # 7. Aplica os filtros in-memory
+        filtered_rows = all_rows
+
+        # Filtro de classificação / estratificação
+        # Valores permitidos no frontend: todos, positivo, provavel, negativo, pos_operatorio
+        filter_strat = stratification.lower().strip()
+        if filter_strat != "todos":
+            filtered_rows = [r for r in filtered_rows if r.get("classificacao") == filter_strat]
+
+        # Filtro de lateralidade
+        # Valores permitidos no frontend: todos, OD, OE, AO, null
+        filter_lat = laterality.upper().strip()
+        if filter_lat != "TODOS":
+            if filter_lat == "NULL":
+                filtered_rows = [r for r in filtered_rows if r.get("lateralidade") is None]
+            else:
+                filtered_rows = [r for r in filtered_rows if r.get("lateralidade") == filter_lat]
+
+        # 8. Calcula o resumo para as linhas filtradas
+        filtered_summary = compute_summary_stats(filtered_rows)
+
+        return {
+            "success": True,
+            "summary": overall_summary,
+            "filtered_summary": filtered_summary,
+            "rows": filtered_rows,
+            "sql": result.get("sql"),
+            "limitations": result.get("limitations", [])
+        }
+
+    except Exception as e:
+        logger.exception("Erro ao processar relatório")
+        return {
+            "success": False,
+            "error": str(e),
+            "summary": {},
+            "filtered_summary": {},
+            "rows": [],
+            "sql": None,
+            "limitations": [str(e)]
+        }
+

@@ -69,7 +69,7 @@ Colunas disponíveis em fp:
 Tabela de dimensao de pacientes (somente para enriquecer com CPF):
 pdgt_amorsaude_inteligencia.dm_pacientes_amei (alias: dp)
 - id_paciente: bigint (chave de join com fp.id_paciente)
-- cpf_paciente: string (CPF em texto, somente exibir mascarado)
+- cpf_paciente: string (CPF em texto, exibir completo sem mascaramento)
 
 Regra de JOIN para CPF:
 - Use LEFT JOIN pdgt_amorsaude_inteligencia.dm_pacientes_amei dp ON dp.id_paciente = fp.id_paciente
@@ -135,10 +135,10 @@ def _make_json_safe(value: Any) -> Any:
 
 
 def _mask_cpf(value: Any) -> Optional[str]:
-    """Mascara CPF no formato ***.***.***-XX (mantem apenas os 2 ultimos digitos).
+    """Formata o CPF no formato 000.000.000-00 sem mascarar ou anonimizar.
 
     Aceita CPF com ou sem mascara, ignora caracteres nao numericos, lida com nulos
-    e valores invalidos retornando None ou a propria string mascarada padrao.
+    e valores invalidos retornando None ou o CPF completo formatado.
     """
     if value is None:
         return None
@@ -149,16 +149,10 @@ def _mask_cpf(value: Any) -> Optional[str]:
 
     digits = re.sub(r"\D", "", raw)
 
-    # CPFs validos tem 11 digitos. Se for menor, ainda exibimos mascarado,
-    # mas indicamos os 2 ultimos digitos disponiveis. Acima de 11, truncamos.
-    if len(digits) < 2:
-        return "***.***.***-**"
+    if len(digits) == 11:
+        return f"{digits[0:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:11]}"
 
-    if len(digits) > 11:
-        digits = digits[-11:]
-
-    last_two = digits[-2:]
-    return f"***.***.***-{last_two}"
+    return raw
 
 
 def _classify_group(value: Any) -> Optional[str]:
@@ -536,7 +530,9 @@ MODO CARACTERIZACAO DE PACIENTES (obrigatorio neste pedido):
     classificacao,
     score,
     termo_detectado,
-    trecho_evidencia
+    trecho_evidencia,
+    lateralidade
+- `lateralidade` deve ser identificada a partir do prontuário (dos campos narrativos/textuais), retornando 'OD', 'OE', 'AO' ou null.
 - `termo_detectado` deve ser construido via expressao logica (CASE/COALESCE) que aponta qual termo do rag_context ativou a classificacao.
 - `trecho_evidencia` deve usar regexp_extract sobre o campo narrativo que casou (limite implicito de tamanho controlado em Python; nao trunque no SQL).
 - LEFT JOIN obrigatorio: `LEFT JOIN pdgt_amorsaude_inteligencia.dm_pacientes_amei dp ON dp.id_paciente = fp.id_paciente` para trazer cpf_paciente.
@@ -812,6 +808,46 @@ Regras obrigatorias:
     return _strip_markdown_sql(fix_response.content)
 
 
+def extract_laterality(row: dict) -> Optional[str]:
+    """Extrai lateralidade ('OD', 'OE', 'AO' ou None) a partir de termos e evidências no registro."""
+    term = str(row.get("termo_detectado") or row.get("termo") or "")
+    evidence = str(row.get("trecho_evidencia") or row.get("evidencia") or "")
+    
+    narrative_text = ""
+    narrative_keys = [
+        'anamnese', 'conduta', 'hipotese_diagnostica', 'observacao',
+        'orientacao', 'solicitacao', 'exame_solicitado', 'prescricao',
+        'posologia', 'obs_atend_oftalmo', 'atestado', 'cid_descricao_detalhada'
+    ]
+    for k in narrative_keys:
+        if k in row:
+            narrative_text += " " + str(row[k] or "")
+            
+    text_lower = f"{term} {evidence} {narrative_text}".lower()
+    text_lower = re.sub(r"\s+", " ", text_lower)
+    
+    # Busca por padrões bilaterais
+    if re.search(r"\b(ambos\s+os\s+olhos|bilateral|ambos\s+olhos)\b", text_lower) or re.search(r"\ba\.o\.(?![a-zA-Z0-9])", text_lower):
+        return "AO"
+        
+    # Busca por AO caso-sensitivo (para evitar casar com a preposição "ao" em minúsculo)
+    raw_text = f"{term} {evidence} {narrative_text}"
+    if re.search(r"\bAO\b", raw_text):
+        return "AO"
+    
+    has_od = re.search(r"\b(od|olho\s+direito|olho\s+dir)\b", text_lower) or re.search(r"\bo\.d\.(?![a-zA-Z0-9])", text_lower)
+    has_oe = re.search(r"\b(oe|olho\s+esquerdo|olho\s+esq)\b", text_lower) or re.search(r"\bo\.e\.(?![a-zA-Z0-9])", text_lower)
+    
+    if has_od and has_oe:
+        return "AO"
+    elif has_od:
+        return "OD"
+    elif has_oe:
+        return "OE"
+        
+    return None
+
+
 def _compact_detail_row(row: dict) -> dict:
     safe_row = _make_json_safe(row)
 
@@ -821,6 +857,10 @@ def _compact_detail_row(row: dict) -> dict:
         or row.get("num_cpf")
     )
     masked_cpf = _mask_cpf(raw_cpf)
+
+    raw_lateralidade = row.get("lateralidade")
+    if not raw_lateralidade:
+        raw_lateralidade = extract_laterality(row)
 
     return {
         "estrato": row.get("estrato") or row.get("classificacao") or row.get("classe"),
@@ -843,6 +883,7 @@ def _compact_detail_row(row: dict) -> dict:
         "uf": row.get("uf"),
         "municipio": row.get("municipio"),
         "nome_profissional": row.get("nome_profissional"),
+        "lateralidade": raw_lateralidade,
         "raw": safe_row,
     }
 
@@ -886,9 +927,9 @@ def _format_sql_result(
 ) -> dict:
     """Formata o retorno preservando dados brutos sempre que existirem.
 
-    Quando grouped_lists=True, NUNCA trunca e produz `grouped_rows` agregando
+    When grouped_lists=True, NUNCA trunca e produz `grouped_rows` agregando
     `rows` por classificacao clinica canonica, alem de `summary` com totais
-    por grupo. CPF aparece sempre mascarado.
+    por grupo. CPF aparece sempre completo.
     """
     if not results:
         return {

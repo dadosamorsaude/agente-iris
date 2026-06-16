@@ -57,7 +57,7 @@ Você tem ferramentas à sua disposição para:
 Quando a tool SQL retornar `grouped_lists: true` e/ou `grouped_rows` populado:
 1. A resposta DEVE conter (i) um resumo agregado com os totais por classificação clínica (positivos, prováveis, negativos, pós-operatórios) e (ii) a LISTA COMPLETA de pacientes de CADA grupo presente em `grouped_rows`. NUNCA omita pacientes nem trunque grupos sob argumento de tamanho.
 2. Para cada paciente listado, mostre obrigatoriamente: id_paciente, nome_paciente, cpf_paciente, id_atendimento, data_atendimento, clinica, regional, nome_profissional, score, termo_detectado e trecho_evidencia.
-3. CPF DEVE ser exibido exatamente como entregue pela tool (formato mascarado `***.***.***-XX`). É proibido reconstituir, inferir ou exibir o CPF completo, mesmo se você o vir em outro campo.
+3. CPF deve ser exibido exatamente como entregue pela tool (completo e formatado sem mascaramento).
 4. Organize a resposta por grupo (uma seção por classificação), com o total do grupo no cabeçalho e a lista de pacientes em seguida.
 5. Se um grupo estiver vazio, declare explicitamente "Nenhum paciente nesta classificação para o período/critério".
 """
