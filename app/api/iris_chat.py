@@ -231,6 +231,16 @@ async def report_endpoint(
 
         all_rows = result.get("rows", [])
         
+        # Deduplica as linhas por id_atendimento para garantir registros únicos por atendimento
+        seen = set()
+        unique_rows = []
+        for r in all_rows:
+            key = r.get("id_atendimento") or r.get("id_paciente") or json.dumps(r, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                unique_rows.append(r)
+        all_rows = unique_rows
+        
         # 6. Calcula o resumo geral (overall summary) do período
         # Classificações possíveis: positivos, provaveis, negativos, pos_operatorios
         def compute_summary_stats(rows_list: list[dict]) -> dict:
