@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     MODEL_NAME_SQL: str = "gpt-5.4-mini"
     TEMPERATURE: float = 0.0
 
-    ANTHROPIC_API_KEY: str
+    ANTHROPIC_API_KEY: Optional[str] = None
     MODEL_CLAUDE: str = "claude-sonnet-4-6"
     TEMPERATURE_CLAUDE: float = 0.4
 
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # Security
     AGENTE_API_KEY: str
-    ALLOWED_ORIGINS: str
+    ALLOWED_ORIGINS: str = "*"
 
     # Memory
     DATABASE_URL: Optional[str] = None

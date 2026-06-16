@@ -21,6 +21,4 @@ RUN uv sync --frozen --no-dev
 # Copy the rest of the application code
 COPY . .
 
-# Use the PORT environment variable provided by Render (default to 8000 if not set)
-# We use 'sh -c' to expand the $PORT environment variable
-CMD ["sh", "-c", "uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", ".venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
