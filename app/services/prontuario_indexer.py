@@ -149,51 +149,66 @@ async def _generate_embeddings(texts: list[str]) -> list[list[float]]:
     return [item.embedding for item in response.data]
 
 
-async def index_batch(rows: list[dict]) -> dict:
+async def index_batch(rows: list[dict], show_progress: bool = False) -> dict:
     """
-    Indexa um batch de prontuários no Pinecone.
+    Indexa um batch de prontuários no Pinecone de forma concorrente.
 
-    - Gera textos anonimizados a partir dos campos narrativos
-    - Skipa registros sem conteúdo narrativo
-    - Faz upsert com id_atendimento como vector ID (idempotente por natureza)
-
-    Returns:
-        dict com chaves: indexed, skipped, errors
+    - Divide as linhas em sub-batches de tamanho BATCH_SIZE
+    - Gera embeddings via OpenAI de forma paralela (limitado por Semaphore)
+    - Faz upsert no Pinecone usando thread pool para não bloquear o loop de eventos
+    - Imprime o progresso em tempo real se show_progress for True
     """
     if not rows:
         return {"indexed": 0, "skipped": 0, "errors": 0}
 
     index = _get_pinecone_index()
-    indexed = skipped = errors = 0
+    
+    # Divide em sub-batches de BATCH_SIZE
+    batches = [rows[i : i + BATCH_SIZE] for i in range(0, len(rows), BATCH_SIZE)]
+    total_rows = len(rows)
+    
+    # Semáforo para limitar concorrência de chamadas à OpenAI e Pinecone
+    sem = asyncio.Semaphore(10)
+    lock = asyncio.Lock()
+    
+    # Contadores globais do lote
+    stats = {"indexed": 0, "skipped": 0, "errors": 0}
+    processed_rows = 0
 
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i : i + BATCH_SIZE]
-
+    async def process_sub_batch(batch_idx: int, batch: list[dict]):
+        nonlocal processed_rows
         # Filtra registros sem conteúdo narrativo
         texts, valid_rows = [], []
+        batch_skipped = 0
         for row in batch:
             text = _build_text(row)
             if not text.strip():
-                skipped += 1
+                batch_skipped += 1
                 continue
             texts.append(text)
             valid_rows.append(row)
 
         if not texts:
-            continue
+            async with lock:
+                stats["skipped"] += batch_skipped
+                processed_rows += len(batch)
+                if show_progress and (processed_rows % 1000 == 0 or processed_rows == total_rows):
+                    print(f"         Progresso: {processed_rows}/{total_rows} prontuários processados...", flush=True)
+            return
 
         try:
-            embeddings = await _generate_embeddings(texts)
+            # Limita a concorrência na geração de embeddings
+            async with sem:
+                embeddings = await _generate_embeddings(texts)
 
             vectors = []
             for row, embedding in zip(valid_rows, embeddings):
                 id_atendimento = str(row.get("id_atendimento", "")).strip()
                 if not id_atendimento:
-                    skipped += 1
+                    batch_skipped += 1
                     continue
 
                 metadata = _build_metadata(row)
-                # Armazena preview do texto para inspeção no Pinecone Dashboard
                 metadata["text"] = _build_text(row)[:1000]
 
                 vectors.append({
@@ -203,26 +218,45 @@ async def index_batch(rows: list[dict]) -> dict:
                 })
 
             if vectors:
-                index.upsert(
-                    vectors=vectors,
-                    namespace=settings.PINECONE_NS_PRONTUARIOS,
-                )
-                indexed += len(vectors)
+                # Upsert é síncrono, então executamos em thread pool (asyncio.to_thread)
+                async with sem:
+                    await asyncio.to_thread(
+                        index.upsert,
+                        vectors=vectors,
+                        namespace=settings.PINECONE_NS_PRONTUARIOS,
+                    )
+
+            async with lock:
+                stats["indexed"] += len(vectors)
+                stats["skipped"] += batch_skipped
+                processed_rows += len(batch)
+                if show_progress and (processed_rows % 1000 == 0 or processed_rows == total_rows):
+                    print(f"         Progresso: {processed_rows}/{total_rows} prontuários processados...", flush=True)
 
         except Exception as e:
-            logger.error(f"Erro ao indexar batch [{i}:{i + BATCH_SIZE}]: {e}")
-            errors += len(texts)
+            logger.error(f"Erro ao indexar sub-batch [{batch_idx * BATCH_SIZE}:{(batch_idx + 1) * BATCH_SIZE}]: {e}")
+            async with lock:
+                stats["errors"] += len(texts)
+                stats["skipped"] += batch_skipped
+                processed_rows += len(batch)
+                if show_progress and (processed_rows % 1000 == 0 or processed_rows == total_rows):
+                    print(f"         Progresso: {processed_rows}/{total_rows} prontuários processados...", flush=True)
 
-    return {"indexed": indexed, "skipped": skipped, "errors": errors}
+    # Executa todos os sub-batches de forma concorrente
+    tasks = [process_sub_batch(idx, b) for idx, b in enumerate(batches)]
+    await asyncio.gather(*tasks)
+
+    return stats
 
 
-async def index_date_range(start_date: str, end_date: str) -> dict:
+async def index_date_range(start_date: str, end_date: str, show_progress: bool = False) -> dict:
     """
     Busca e indexa todos os prontuários de um período [start_date, end_date).
 
     Args:
         start_date: Data inicial ISO (YYYY-MM-DD), inclusiva
         end_date:   Data final ISO (YYYY-MM-DD), exclusiva
+        show_progress: Se True, imprime progresso de processamento no terminal
 
     Returns:
         dict com chaves: indexed, skipped, errors, total_fetched
@@ -236,7 +270,7 @@ async def index_date_range(start_date: str, end_date: str) -> dict:
     total_fetched = len(rows)
     logger.info(f"Prontuários buscados: {total_fetched} | {start_date} → {end_date}")
 
-    result = await index_batch(rows)
+    result = await index_batch(rows, show_progress=show_progress)
     result["total_fetched"] = total_fetched
 
     logger.info(
@@ -278,6 +312,7 @@ async def index_historical_90_days() -> dict:
         result = await index_date_range(
             start_date=window_start.isoformat(),
             end_date=window_end.isoformat(),
+            show_progress=True,
         )
         for key in total:
             total[key] += result.get(key, 0)

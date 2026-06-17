@@ -1,37 +1,50 @@
+# -*- coding: utf-8 -*-
 """
-Script de Carga Histórica — Indexação de Prontuários no Pinecone
-
-Executa a indexação dos últimos 90 dias diretamente da sua máquina,
-usando as credenciais do .env local.
+Script de Carga Historica -- Indexacao de Prontuarios no Pinecone
 
 Uso:
     uv run python scripts/run_historical_index.py
-
-    # Ou com período customizado:
-    uv run python scripts/run_historical_index.py --start 2026-01-01 --end 2026-06-17
-
-    # Para indexar apenas D-1 (teste rápido):
     uv run python scripts/run_historical_index.py --mode d1
+    uv run python scripts/run_historical_index.py --mode range --start 2026-01-01 --end 2026-06-17
 """
 
 import asyncio
 import argparse
+import logging
 import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
-# Garante que o root do projeto está no path
+# Root do projeto no path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Configura o logger do indexador
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.FileHandler("indexer.log", encoding="utf-8")],
+)
+# Muta as bibliotecas de terceiros muito barulhentas
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("botocore").setLevel(logging.WARNING)
+logging.getLogger("pyathena").setLevel(logging.WARNING)
+logging.getLogger("app.services.prontuario_indexer").setLevel(logging.INFO)
+
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-from app.services.prontuario_indexer import (
-    index_historical_90_days,
-    index_yesterday,
-    index_date_range,
-)
+from app.services.prontuario_indexer import index_yesterday, index_date_range
+from app.core.config import settings
+
+
+def p(msg: str = "", flush: bool = True):
+    """Print com flush imediato para evitar buffering no Windows."""
+    print(msg, flush=flush)
 
 
 def fmt_duration(seconds: float) -> str:
@@ -44,93 +57,174 @@ def fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
-def print_header(mode: str, start: str = None, end: str = None):
-    print()
-    print("=" * 60)
-    print("  Iris -- Indexacao de Prontuarios no Pinecone")
-    print("=" * 60)
-    if mode == "historico":
-        inicio = date.today() - timedelta(days=90)
-        fim = date.today()
-        print(f"  Modo     : Carga Historica 90 dias")
-        print(f"  Periodo  : {inicio} -> {fim}")
-        print(f"  Estimado : ~405.000 atendimentos | ~$26 USD")
-    elif mode == "d1":
-        yesterday = date.today() - timedelta(days=1)
-        print(f"  Modo     : D-1 (dia anterior)")
-        print(f"  Periodo  : {yesterday}")
-        print(f"  Estimado : ~4.500 atendimentos | ~$0.29 USD")
-    elif mode == "range":
-        print(f"  Modo     : Periodo Customizado")
-        print(f"  Periodo  : {start} -> {end}")
-    print("=" * 60)
-    print()
+async def run_historico():
+    """Carga historica dos ultimos 90 dias em janelas de 7 dias."""
+    end = date.today()
+    start = end - timedelta(days=90)
 
+    p("=" * 60)
+    p("  Iris -- Indexacao Historica 90 dias")
+    p("=" * 60)
+    p(f"  Periodo  : {start} -> {end}")
+    p(f"  Estimado : ~405.000 atendimentos | ~$26 USD")
+    p(f"  Logs     : indexer.log (neste diretorio)")
+    p("=" * 60)
+    p()
 
-def print_result(result: dict, duration: float):
-    print()
-    print("=" * 60)
-    print("  RESULTADO")
-    print("=" * 60)
-    print(f"  Buscados   : {result.get('total_fetched', 0):,}")
-    print(f"  Indexados  : {result.get('indexed', 0):,}")
-    print(f"  Ignorados  : {result.get('skipped', 0):,}  (sem conteudo narrativo)")
-    print(f"  Erros      : {result.get('errors', 0):,}")
-    print(f"  Duracao    : {fmt_duration(duration)}")
-    print("=" * 60)
+    # Gera todas as janelas de 7 dias
+    windows = []
+    w_start = start
+    while w_start < end:
+        w_end = min(w_start + timedelta(days=7), end)
+        windows.append((w_start.isoformat(), w_end.isoformat()))
+        w_start = w_end
 
-    errors = result.get("errors", 0)
-    if errors == 0:
-        print("\n  OK - Indexacao concluida com sucesso!")
-        print("     Namespace 'prontuarios_pacientes' disponivel no Pinecone.")
+    total_janelas = len(windows)
+    grand_total = {"indexed": 0, "skipped": 0, "errors": 0, "total_fetched": 0}
+
+    t_global = time.time()
+
+    for i, (w_start, w_end) in enumerate(windows, start=1):
+        p(f"  [{i:02d}/{total_janelas}] Janela: {w_start} -> {w_end} ...", flush=True)
+        t_janela = time.time()
+
+        result = await index_date_range(start_date=w_start, end_date=w_end, show_progress=True)
+
+        dur = fmt_duration(time.time() - t_janela)
+        p(f"         Buscados={result.get('total_fetched',0):,} | "
+          f"Indexados={result.get('indexed',0):,} | "
+          f"Ignorados={result.get('skipped',0):,} | "
+          f"Erros={result.get('errors',0):,} | "
+          f"Tempo={dur}")
+
+        for key in grand_total:
+            grand_total[key] += result.get(key, 0)
+
+        # Pausa entre janelas
+        if i < total_janelas:
+            await asyncio.sleep(2)
+
+    dur_total = fmt_duration(time.time() - t_global)
+
+    p()
+    p("=" * 60)
+    p("  RESULTADO FINAL")
+    p("=" * 60)
+    p(f"  Janelas    : {total_janelas}")
+    p(f"  Buscados   : {grand_total['total_fetched']:,}")
+    p(f"  Indexados  : {grand_total['indexed']:,}")
+    p(f"  Ignorados  : {grand_total['skipped']:,}")
+    p(f"  Erros      : {grand_total['errors']:,}")
+    p(f"  Duracao    : {dur_total}")
+    p("=" * 60)
+
+    if grand_total["errors"] == 0:
+        p()
+        p("  OK - Indexacao concluida com sucesso!")
+        p("  Namespace 'prontuarios_pacientes' disponivel no Pinecone.")
     else:
-        print(f"\n  AVISO: Concluido com {errors} erros. Verifique os logs acima.")
-    print()
+        p()
+        p(f"  AVISO: {grand_total['errors']:,} erros. Consulte indexer.log para detalhes.")
+    p()
+
+    return grand_total
+
+
+async def run_d1():
+    """Indexa apenas o dia anterior (D-1)."""
+    yesterday = date.today() - timedelta(days=1)
+    today = date.today()
+
+    p("=" * 60)
+    p("  Iris -- Indexacao D-1")
+    p("=" * 60)
+    p(f"  Periodo  : {yesterday} -> {today}")
+    p(f"  Logs     : indexer.log")
+    p("=" * 60)
+    p()
+    p("  Executando...", flush=True)
+
+    t = time.time()
+    result = await index_yesterday()
+    dur = fmt_duration(time.time() - t)
+
+    p()
+    p("=" * 60)
+    p("  RESULTADO")
+    p("=" * 60)
+    p(f"  Buscados   : {result.get('total_fetched', 0):,}")
+    p(f"  Indexados  : {result.get('indexed', 0):,}")
+    p(f"  Ignorados  : {result.get('skipped', 0):,}")
+    p(f"  Erros      : {result.get('errors', 0):,}")
+    p(f"  Duracao    : {dur}")
+    p("=" * 60)
+    p()
+
+    return result
+
+
+async def run_range(start_date: str, end_date: str):
+    """Indexa um periodo customizado."""
+    p("=" * 60)
+    p("  Iris -- Indexacao Periodo Customizado")
+    p("=" * 60)
+    p(f"  Periodo  : {start_date} -> {end_date}")
+    p(f"  Logs     : indexer.log")
+    p("=" * 60)
+    p()
+    p("  Executando...", flush=True)
+
+    t = time.time()
+    result = await index_date_range(start_date=start_date, end_date=end_date, show_progress=True)
+    dur = fmt_duration(time.time() - t)
+
+    p()
+    p("=" * 60)
+    p("  RESULTADO")
+    p("=" * 60)
+    p(f"  Buscados   : {result.get('total_fetched', 0):,}")
+    p(f"  Indexados  : {result.get('indexed', 0):,}")
+    p(f"  Ignorados  : {result.get('skipped', 0):,}")
+    p(f"  Erros      : {result.get('errors', 0):,}")
+    p(f"  Duracao    : {dur}")
+    p("=" * 60)
+    p()
+
+    return result
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Indexação de prontuários no Pinecone")
+    parser = argparse.ArgumentParser(description="Indexacao de prontuarios no Pinecone")
     parser.add_argument(
         "--mode",
         choices=["historico", "d1", "range"],
         default="historico",
-        help="Modo de indexação: historico (90d), d1 (ontem), range (customizado)",
+        help="historico (90d), d1 (ontem), range (customizado)",
     )
     parser.add_argument("--start", help="Data inicial YYYY-MM-DD (modo range)")
     parser.add_argument("--end", help="Data final YYYY-MM-DD, exclusiva (modo range)")
     args = parser.parse_args()
 
     if args.mode == "range" and (not args.start or not args.end):
-        print("Erro: --start e --end são obrigatórios no modo range.")
+        p("Erro: --start e --end sao obrigatorios no modo range.")
         sys.exit(1)
-
-    print_header(args.mode, args.start, args.end)
-
-    if args.mode == "historico":
-        print("  Processando em janelas de 7 dias para respeitar os")
-        print("  rate limits da OpenAI. Acompanhe o progresso nos logs:\n")
-
-    start_time = time.time()
 
     try:
         if args.mode == "historico":
-            result = await index_historical_90_days()
+            await run_historico()
         elif args.mode == "d1":
-            result = await index_yesterday()
+            await run_d1()
         else:
-            result = await index_date_range(
-                start_date=args.start,
-                end_date=args.end,
-            )
+            await run_range(args.start, args.end)
     except KeyboardInterrupt:
-        print("\n\n  ⚠️  Interrompido pelo usuário. Dados parcialmente indexados.")
+        p()
+        p("  Interrompido. Dados parcialmente indexados.")
+        p("  Para retomar, use --mode range com a data onde parou.")
         sys.exit(0)
     except Exception as e:
-        print(f"\n  ❌ Erro fatal: {e}")
+        p(f"\n  ERRO FATAL: {e}")
+        p("  Consulte indexer.log para o traceback completo.")
         sys.exit(1)
-
-    duration = time.time() - start_time
-    print_result(result, duration)
 
 
 if __name__ == "__main__":
