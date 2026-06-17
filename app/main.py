@@ -1,8 +1,8 @@
 from dotenv import load_dotenv
 
 # CRÍTICO: load_dotenv DEVE ser a primeira instrução antes de qualquer import
-# do projeto, para garantir que as variáveis de ambiente (incluindo Langfuse)
-# estejam disponíveis quando os módulos forem carregados.
+# do projeto, para garantir que as variáveis de ambiente estejam disponíveis
+# quando os módulos forem carregados.
 load_dotenv(override=True)
 
 import os
@@ -12,16 +12,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.core.clients import aclose_clients
 from app.core.logger import logger
 from app.core.observability import configure_langsmith, flush_langsmith
+from app.services.memory import close_pool
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Gerencia o ciclo de vida da aplicação.
-    - Startup: configura o Langfuse com as variáveis já carregadas pelo dotenv.
-    - Shutdown: faz flush de todos os traces pendentes antes de encerrar.
+    - Startup: configura LangSmith.
+    - Shutdown: faz flush de traces, fecha o pool do Postgres e os clientes HTTP
+      compartilhados (httpx) para evitar conexões pendentes em redeploys.
     """
     # --- Startup ---
     configure_langsmith()
@@ -30,8 +33,19 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- Shutdown ---
-    logger.info("Encerrando aplicação — fazendo flush do LangSmith...")
-    flush_langsmith()
+    logger.info("Encerrando aplicação...")
+    try:
+        flush_langsmith()
+    except Exception as e:
+        logger.warning(f"Falha no flush_langsmith: {e}")
+    try:
+        await close_pool()
+    except Exception as e:
+        logger.warning(f"Falha no close_pool: {e}")
+    try:
+        await aclose_clients()
+    except Exception as e:
+        logger.warning(f"Falha no aclose_clients: {e}")
     logger.info("Shutdown concluído.")
 
 
@@ -45,9 +59,6 @@ app = FastAPI(
 from app.core.config import settings
 from app.api.chat import router as chat_router
 from app.api.metrics import router as metrics_router
-from app.api.audio import router as audio_router
-from app.api.voice import router as voice_router
-from app.api.ws import router as ws_router
 from app.api.iris_chat import router as iris_router
 from app.api.indexer_router import router as indexer_router
 
@@ -78,9 +89,6 @@ async def log_requests(request: Request, call_next):
 
 app.include_router(chat_router)
 app.include_router(metrics_router)
-app.include_router(audio_router)
-app.include_router(voice_router)
-app.include_router(ws_router)
 app.include_router(iris_router)
 app.include_router(indexer_router)
 

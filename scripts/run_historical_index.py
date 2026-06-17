@@ -11,19 +11,34 @@ Uso:
 import asyncio
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import date, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # Root do projeto no path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Configura o logger do indexador
+# Configura o logger do indexador com rotação para não estourar disco.
+# Em ambiente CI (GitHub Actions, daily_index.yml) basta logar para stdout.
+_LOG_PATH = os.getenv("INDEXER_LOG_FILE", "indexer.log")
+_handlers: list[logging.Handler] = [
+    RotatingFileHandler(
+        _LOG_PATH,
+        maxBytes=10 * 1024 * 1024,   # 10 MB por arquivo
+        backupCount=2,                # mantém indexer.log + .1 + .2
+        encoding="utf-8",
+    )
+]
+if os.getenv("CI") or os.getenv("GITHUB_ACTIONS"):
+    _handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler("indexer.log", encoding="utf-8")],
+    handlers=_handlers,
 )
 # Muta as bibliotecas de terceiros muito barulhentas
 logging.getLogger("openai").setLevel(logging.WARNING)

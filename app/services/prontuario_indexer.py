@@ -15,9 +15,7 @@ import asyncio
 import logging
 from datetime import date, timedelta
 
-from openai import AsyncOpenAI
-from pinecone import Pinecone
-
+from app.core.clients import openai_async, pinecone_index
 from app.core.config import settings
 from app.tools.athena import _execute_athena_query
 
@@ -73,11 +71,10 @@ _ATHENA_COLUMNS = [
 
 
 def _get_pinecone_index():
-    """Retorna o índice Pinecone configurado."""
+    """Retorna o índice Pinecone configurado (singleton)."""
     if not settings.PINECONE_API_KEY:
         raise RuntimeError("PINECONE_API_KEY não configurada.")
-    pc = Pinecone(api_key=settings.PINECONE_API_KEY)
-    return pc.Index(settings.PINECONE_RAG_INDEX)
+    return pinecone_index(settings.PINECONE_RAG_INDEX)
 
 
 def _build_text(row: dict) -> str:
@@ -139,9 +136,8 @@ def _fetch_prontuarios_by_ids(ids_atendimento: list[str]) -> list[dict]:
 
 
 async def _generate_embeddings(texts: list[str]) -> list[list[float]]:
-    """Gera embeddings em batch via OpenAI text-embedding-3-large."""
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.embeddings.create(
+    """Gera embeddings em batch via OpenAI text-embedding-3-large (singleton)."""
+    response = await openai_async().embeddings.create(
         model=EMBEDDING_MODEL,
         input=texts,
         dimensions=EMBEDDING_DIMENSIONS,
@@ -167,8 +163,9 @@ async def index_batch(rows: list[dict], show_progress: bool = False) -> dict:
     batches = [rows[i : i + BATCH_SIZE] for i in range(0, len(rows), BATCH_SIZE)]
     total_rows = len(rows)
     
-    # Semáforo para limitar concorrência de chamadas à OpenAI e Pinecone
-    sem = asyncio.Semaphore(10)
+    # Semáforo para limitar concorrência (Render free tem 512MB de RAM,
+    # cada batch carrega ~12MB de embeddings — segura em 2 paralelos).
+    sem = asyncio.Semaphore(2)
     lock = asyncio.Lock()
     
     # Contadores globais do lote

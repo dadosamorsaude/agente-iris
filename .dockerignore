@@ -19,6 +19,7 @@ ENV/
 # Data and Logs
 rag/
 scratch/
+temp_audios/
 *.log
 
 # Git
@@ -29,10 +30,13 @@ scratch/
 Dockerfile
 .dockerignore
 
+# Docs / repositório local
+AVALIACAO_CODIGO.md
+README.md
+
 # IDEs
 .vscode/
 .idea/
 
-# Scripts
-chunking-*.py
-criar_index_pinecone.py
+# Tests (não vão para imagem de produção)
+tests/

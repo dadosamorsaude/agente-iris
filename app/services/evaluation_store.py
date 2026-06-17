@@ -1,35 +1,33 @@
 """
-Persistência das avaliações de acurácia da Iris no Supabase REST API.
+Persistência das avaliações de acurácia da Iris no Supabase REST.
 
-Mantém histórico de avaliações e execuções no Supabase,
-usando fallback para lista in-memory se DATABASE_URL/API_KEY não estiverem configurados.
-
-NOTA: Todas as chamadas HTTP usam httpx.AsyncClient para não bloquear o event loop.
+Fallback in-memory limitado por `deque(maxlen=MEMORY_STORE_CAPACITY)` para
+evitar crescimento ilimitado em ambientes sem banco (Render free 512 MB).
 """
 
-import json
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timedelta
-from collections import Counter
+from collections import Counter, deque
+from datetime import datetime, timedelta, timezone
 
-import httpx
-
+from app.core.clients import supabase_request
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Fallback in-memory quando não há banco configurado
-_memory_store: list[dict] = []
+# Fallback in-memory com teto (último N) — evita OOM se Supabase cair.
+MEMORY_STORE_CAPACITY = 200
+_memory_store: deque[dict] = deque(maxlen=MEMORY_STORE_CAPACITY)
 
 
-def _get_headers() -> dict:
-    if not settings.DATABASE_API_KEY:
-        return {}
-    return {
-        "apikey": settings.DATABASE_API_KEY,
-        "Authorization": f"Bearer {settings.DATABASE_API_KEY}",
-        "Content-Type": "application/json",
-    }
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Escrita
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 async def save_evaluation(
@@ -39,13 +37,10 @@ async def save_evaluation(
     raw_athena_data: list[dict],
     evaluation: dict,
 ) -> None:
-    """
-    Persiste o resultado de uma avaliação.
-    Usa Supabase REST (async) se disponível, caso contrário armazena em memória.
-    """
+    """Persiste o resultado de uma avaliação."""
     record = {
         "user_id": user_id,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": _now_iso(),
         "question": question,
         "response": response,
         "raw_data": raw_athena_data,
@@ -64,18 +59,20 @@ async def save_evaluation(
 
     if settings.supabase_rest_url and settings.DATABASE_API_KEY:
         try:
-            url = f"{settings.supabase_rest_url}evaluation_logs_iris"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, headers=_get_headers(), json=record)
+            resp = await supabase_request(
+                "POST", "evaluation_logs_iris", json_body=record,
+            )
+            if resp is not None:
                 resp.raise_for_status()
-            logger.info(f"Avaliação salva no Supabase via REST | score={record['score']}")
-            return
+                logger.info(f"Avaliação salva no Supabase | score={record['score']}")
+                return
         except Exception as e:
             logger.warning(f"Falha ao salvar avaliação via REST, usando in-memory: {e}")
 
-    # Fallback: in-memory (sem persistência entre reinicializações)
     _memory_store.append(record)
-    logger.info(f"Avaliação salva in-memory | score={record['score']} | total={len(_memory_store)}")
+    logger.info(
+        f"Avaliação salva in-memory | score={record['score']} | total={len(_memory_store)}"
+    )
 
 
 async def save_execution_log(
@@ -85,10 +82,7 @@ async def save_execution_log(
     original_input: str,
     result: dict,
 ) -> None:
-    """
-    Salva o log de execução clínica estruturado da Iris na tabela de auditoria
-    judge_evaluations (Supabase). Garante fidelidade total com os campos do logging.json.
-    """
+    """Salva o log de execução estruturado na tabela judge_evaluations."""
     if not settings.supabase_rest_url or not settings.DATABASE_API_KEY:
         logger.warning("Supabase não configurado. Ignorando gravação de log de execução.")
         return
@@ -96,24 +90,27 @@ async def save_execution_log(
     try:
         final_answer = result.get("final_answer", result.get("output", ""))
 
-        def clip(v, max_chars):
+        def clip(v, max_chars: int) -> str | None:
             if v is None:
                 return None
             s = str(v)
             return s[:max_chars] + "..." if len(s) > max_chars else s
 
         meta_payload = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": _now_iso(),
             "workflow_stage": result.get("workflow_stage"),
             "unit_of_analysis": result.get("unit_of_analysis"),
             "periodo": result.get("periodo"),
             "validated": result.get("validated", False),
             "has_data": result.get("has_data", False),
             "orchestration": result.get("orchestration", {}),
-            "final_delivery_policy": result.get("final_delivery_policy", "delivered_without_blocking"),
+            "final_delivery_policy": result.get(
+                "final_delivery_policy", "delivered_without_blocking"
+            ),
         }
 
         judge_output = result.get("judge_output") or {}
+        judge_score = float(result.get("judge_score") or 0.0)
 
         payload = {
             "workflow_id": "projeto-iris-backend",
@@ -128,7 +125,7 @@ async def save_execution_log(
             "sql_used": result.get("sql_used", False),
             "row_count": result.get("executor_row_count", 0),
             "judge_passed": result.get("judge_passed", False),
-            "judge_score": float(result.get("judge_score") or 0.0),
+            "judge_score": judge_score,
             "block_reason": judge_output.get("block_reason") or (
                 result.get("errorType") if result.get("error") else None
             ),
@@ -138,80 +135,54 @@ async def save_execution_log(
             "metadata": meta_payload,
             "retry_count": result.get("retry_count", 0),
             "max_retries": 0,
-            # converte de volta para escala 0-100 para o Metabase
-            "score_final": float(result.get("judge_score") or 0.0) * 100.0,
+            "score_final": judge_score * 100.0,
         }
 
-        url = f"{settings.supabase_rest_url}judge_evaluations"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, headers=_get_headers(), json=payload)
-            resp.raise_for_status()
-
-        logger.info(
-            f"Log de execução da Iris salvo com sucesso via REST na tabela "
-            f"'judge_evaluations' | job_id={job_id}"
+        resp = await supabase_request(
+            "POST", "judge_evaluations", json_body=payload,
         )
+        if resp is not None:
+            resp.raise_for_status()
+            logger.info(f"Log de execução salvo | job_id={job_id}")
     except Exception as e:
-        logger.error(f"Erro ao salvar log de execução via REST em 'judge_evaluations': {e}")
+        logger.error(f"Erro ao salvar log de execução: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Leitura
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 async def get_evaluation_summary() -> dict:
     """Retorna o resumo agregado de todas as avaliações."""
     if settings.supabase_rest_url and settings.DATABASE_API_KEY:
         try:
-            url = f"{settings.supabase_rest_url}evaluation_logs_iris?select=score,approved,created_at,errors"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, headers=_get_headers())
+            resp = await supabase_request(
+                "GET",
+                "evaluation_logs_iris",
+                params={"select": "score,approved,created_at,errors"},
+            )
+            if resp is not None:
                 resp.raise_for_status()
                 rows = resp.json()
-
-            if not rows:
-                return _summary_from_memory()
-
-            total = len(rows)
-            scores = [r.get("score", 0) or 0 for r in rows]
-            approved = [1 for r in rows if r.get("approved")]
-            avg_score = sum(scores) / total
-
-            limit_7d = datetime.utcnow() - timedelta(days=7)
-            scores_7d = []
-            for r in rows:
-                try:
-                    dt = datetime.fromisoformat(r["created_at"][:19])
-                    if dt >= limit_7d:
-                        scores_7d.append(r.get("score", 0) or 0)
-                except Exception:
-                    pass
-            avg_score_7d = sum(scores_7d) / len(scores_7d) if scores_7d else 0.0
-
-            errors_list = []
-            for r in rows:
-                if not r.get("approved") and r.get("errors"):
-                    errs = r["errors"]
-                    if isinstance(errs, list):
-                        errors_list.extend(errs)
-
-            return {
-                "total_evaluations": total,
-                "avg_score": round(avg_score, 1),
-                "approved_rate": round(100.0 * len(approved) / total, 1),
-                "avg_score_last_7d": round(avg_score_7d, 1),
-                "common_errors": _top_errors(errors_list),
-            }
-
+                if rows:
+                    return _summary_from_rows(rows)
         except Exception as e:
-            logger.error(f"Erro ao buscar resumo via REST, caindo no fallback in-memory: {e}")
+            logger.error(f"Erro ao buscar resumo via REST, usando in-memory: {e}")
 
-    return _summary_from_memory()
+    return _summary_from_rows(list(_memory_store))
 
 
 async def get_evaluation_history(limit: int = 20) -> list[dict]:
     """Retorna as últimas avaliações via REST."""
     if settings.supabase_rest_url and settings.DATABASE_API_KEY:
         try:
-            url = f"{settings.supabase_rest_url}evaluation_logs_iris?order=created_at.desc&limit={limit}"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, headers=_get_headers())
+            resp = await supabase_request(
+                "GET",
+                "evaluation_logs_iris",
+                params={"order": "created_at.desc", "limit": str(limit)},
+            )
+            if resp is not None:
                 resp.raise_for_status()
                 return resp.json()
         except Exception as e:
@@ -221,17 +192,16 @@ async def get_evaluation_history(limit: int = 20) -> list[dict]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers privados
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _top_errors(errors: list[str], n: int = 5) -> list[str]:
-    """Retorna os N erros mais frequentes."""
     return [err for err, _ in Counter(errors).most_common(n)]
 
 
-def _summary_from_memory() -> dict:
-    data = _memory_store
-    if not data:
+def _summary_from_rows(rows: list[dict]) -> dict:
+    if not rows:
         return {
             "total_evaluations": 0,
             "avg_score": 0.0,
@@ -240,14 +210,38 @@ def _summary_from_memory() -> dict:
             "common_errors": [],
         }
 
-    scores = [d["score"] for d in data]
-    approved = [d["approved"] for d in data]
-    all_errors = [e for d in data for e in d.get("errors", [])]
+    total = len(rows)
+    scores = [r.get("score", 0) or 0 for r in rows]
+    approved_count = sum(1 for r in rows if r.get("approved"))
+    avg_score = sum(scores) / total
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    scores_7d = []
+    for r in rows:
+        ts = r.get("created_at")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(ts)[:19])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= cutoff:
+                scores_7d.append(r.get("score", 0) or 0)
+        except Exception:
+            continue
+    avg_score_7d = sum(scores_7d) / len(scores_7d) if scores_7d else 0.0
+
+    all_errors: list[str] = []
+    for r in rows:
+        if not r.get("approved") and r.get("errors"):
+            errs = r["errors"]
+            if isinstance(errs, list):
+                all_errors.extend(errs)
 
     return {
-        "total_evaluations": len(data),
-        "avg_score": round(sum(scores) / len(scores), 1),
-        "approved_rate": round(100 * sum(approved) / len(approved), 1),
-        "avg_score_last_7d": round(sum(scores) / len(scores), 1),
+        "total_evaluations": total,
+        "avg_score": round(avg_score, 1),
+        "approved_rate": round(100.0 * approved_count / total, 1),
+        "avg_score_last_7d": round(avg_score_7d, 1),
         "common_errors": _top_errors(all_errors),
     }

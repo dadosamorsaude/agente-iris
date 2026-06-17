@@ -10,6 +10,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from app.core.config import settings
 from app.core.observability import traceable
 from app.services.llm import get_chat_model_openai
 
@@ -177,7 +178,7 @@ async def evaluate_response(
             "issues": parsed.get("issues", []),
             "erros_encontrados": parsed.get("issues", []),
             "justificativa": parsed.get("justificativa", "Avaliação de auditoria clínica concluída."),
-            "evaluated_at": datetime.utcnow().isoformat(),
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
             "model": settings.MODEL_NAME,
             "had_rag_context": bool(rag_context),
             "had_athena_data": bool(raw_athena_data),
@@ -215,6 +216,3 @@ def _unavailable_metric(reason: str, reason_type: str = "judge_unavailable") -> 
         "metric_only": True,
         "metric_available": False,
     }
-
-
-_empty_evaluation = _unavailable_metric

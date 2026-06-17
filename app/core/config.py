@@ -42,10 +42,9 @@ class Settings(BaseSettings):
     DATABASE_URL: Optional[str] = None
     DATABASE_API_KEY: Optional[str] = None
 
-    # Observability
-    LANGFUSE_SECRET_KEY: Optional[str] = None
-    LANGFUSE_PUBLIC_KEY: Optional[str] = None
-    LANGFUSE_BASE_URL: Optional[str] = None
+    # HTTP / Resiliência (timeouts compartilhados por todos os clientes externos)
+    HTTP_TIMEOUT: float = 30.0
+    HTTP_MAX_RETRIES: int = 2
 
     @property
     def supabase_rest_url(self) -> Optional[str]:

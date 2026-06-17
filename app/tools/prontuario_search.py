@@ -16,9 +16,8 @@ import json
 import logging
 
 from langchain_core.tools import tool
-from langchain_openai import OpenAIEmbeddings
-from pinecone import Pinecone
 
+from app.core.clients import embeddings_3_large, pinecone_index
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -26,8 +25,7 @@ logger = logging.getLogger(__name__)
 
 def _search_pinecone(query_vector: list[float], top_k: int) -> list:
     """Executa busca vetorial síncrona no Pinecone (chamada via asyncio.to_thread)."""
-    pc = Pinecone(api_key=settings.PINECONE_API_KEY)
-    index = pc.Index(settings.PINECONE_RAG_INDEX)
+    index = pinecone_index(settings.PINECONE_RAG_INDEX)
     result = index.query(
         vector=query_vector,
         top_k=top_k,
@@ -63,12 +61,7 @@ async def search_similar_records(query: str, top_k: int = 20) -> str:
         })
 
     try:
-        embeddings = OpenAIEmbeddings(
-            api_key=settings.OPENAI_API_KEY,
-            model="text-embedding-3-large",
-            dimensions=3072,
-        )
-        query_vector = await embeddings.aembed_query(query)
+        query_vector = await embeddings_3_large().aembed_query(query)
         matches = await asyncio.to_thread(_search_pinecone, query_vector, top_k)
 
         if not matches:

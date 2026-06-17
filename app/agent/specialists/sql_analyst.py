@@ -14,12 +14,32 @@ Melhorias principais:
 - Preserva os dados brutos retornados pelo Athena em modos detalhados.
 """
 
+import asyncio
 import json
 import logging
+import random
 import re
-import unicodedata
 from datetime import datetime, timedelta, date
 from typing import Any, Optional
+
+# Política de retry de SQL: 3 tentativas com backoff exponencial + jitter.
+# Em incidentes do Athena (throttling), evita rajadas que amplificam o problema.
+SQL_RETRY_MAX_ATTEMPTS = 3
+SQL_RETRY_BASE_SLEEP = 1.5  # segundos
+SQL_RETRY_MAX_SLEEP = 8.0   # teto do backoff
+
+# Erros lógicos do Athena que NÃO valem retry com repair (são 4xx do nosso lado).
+# Devemos abortar imediatamente sem gastar tokens de LLM tentando consertar.
+_PERMANENT_ATHENA_ERRORS = (
+    "InvalidRequestException",
+    "AccessDeniedException",
+    "ResourceNotFoundException",
+)
+
+
+def _is_transient_athena_error(msg: str) -> bool:
+    """True se o erro é elegível para retry com auto-repair via LLM."""
+    return not any(perm in msg for perm in _PERMANENT_ATHENA_ERRORS)
 
 from app.core.observability import get_langsmith_callbacks, traceable
 from app.services.intent import normalize_text, detect_grouped_lists
@@ -1162,9 +1182,8 @@ async def sql_analyst_expert(
 
     current_sql = sql
     last_error = ""
-    max_attempts = 3
 
-    for attempt in range(max_attempts):
+    for attempt in range(SQL_RETRY_MAX_ATTEMPTS):
         try:
             results = await _execute_query(current_sql)
 
@@ -1203,11 +1222,31 @@ async def sql_analyst_expert(
         except Exception as e:
             last_error = str(e)
             logger.error(
-                f"SQL Analyst: Tentativa {attempt + 1}/{max_attempts} falhou: {last_error}"
+                f"SQL Analyst: Tentativa {attempt + 1}/{SQL_RETRY_MAX_ATTEMPTS} "
+                f"falhou: {last_error}"
             )
 
-            if attempt < max_attempts - 1:
-                logger.info(f"SQL Analyst: Corrigindo SQL e reexecutando (tentativa {attempt + 2})...")
+            # Erros permanentes (4xx Athena) — não vale gastar LLM com repair.
+            if not _is_transient_athena_error(last_error):
+                logger.warning(
+                    "SQL Analyst: erro permanente do Athena, abortando retries."
+                )
+                break
+
+            if attempt < SQL_RETRY_MAX_ATTEMPTS - 1:
+                # Backoff exponencial + jitter (full jitter, AWS-style).
+                # Reduz pressão no Athena em incidentes de throttling.
+                sleep_for = min(
+                    SQL_RETRY_MAX_SLEEP,
+                    SQL_RETRY_BASE_SLEEP * (2 ** attempt),
+                )
+                sleep_for = random.uniform(0, sleep_for)
+                logger.info(
+                    f"SQL Analyst: aguardando {sleep_for:.2f}s e tentando "
+                    f"auto-repair (tentativa {attempt + 2})..."
+                )
+                await asyncio.sleep(sleep_for)
+
                 current_sql = await _repair_sql_for_execution(
                     original_sql=current_sql,
                     error_msg=last_error,
@@ -1224,13 +1263,18 @@ async def sql_analyst_expert(
                 except ValueError as ve:
                     logger.warning(f"SQL regenerado continuou invalido: {ve}")
 
-    logger.error(f"SQL Analyst: Todas as {max_attempts} tentativas falharam")
+    logger.error(
+        f"SQL Analyst: Todas as {SQL_RETRY_MAX_ATTEMPTS} tentativas falharam"
+    )
 
     return {
         "execution_status": "error",
         "error": {
             "type": "sql_executor_error",
-            "message": f"Todas as {max_attempts} tentativas falharam. Ultimo erro: {last_error}",
+            "message": (
+                f"Todas as {SQL_RETRY_MAX_ATTEMPTS} tentativas falharam. "
+                f"Ultimo erro: {last_error}"
+            ),
         },
         "summary": {},
         "rows": [],

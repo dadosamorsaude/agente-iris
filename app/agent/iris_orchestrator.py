@@ -3,23 +3,21 @@ Iris Orchestrator — React Agent
 """
 
 import asyncio
-import json
 import logging
 import uuid
 from datetime import date
 from typing import Any, AsyncGenerator
 
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessageChunk, AIMessage
+from langchain_core.messages import HumanMessage, AIMessageChunk
 from langgraph.prebuilt import create_react_agent
 
-from app.core.config import settings
-from app.core.observability import flush_langsmith, get_langsmith_callbacks, traceable
+from app.core.observability import flush_langsmith, traceable
 from app.services.intent import detect_intent
 from app.agent.evaluator import evaluate_response
 from app.services.learning import generate_lessons_from_execution, save_learned_lessons
 from app.services.evaluation_store import save_execution_log
 from app.services.memory import get_session_history, add_user_message, add_ai_message
-from app.services.llm import get_chat_model_openai, get_chat_model_claude
+from app.services.llm import get_chat_model_claude
 from app.tools.athena import athena_results_context
 from app.tools.rag import rag_results_context
 from app.agent.tools import tools

@@ -1,25 +1,14 @@
 # Environments
 .env
 .env.*
-criar_index_pinecone.py
-chunking-normas.py
-chunking-regras.py
-chunking-rdc.py
-chunking-catarata.py
-check_eval.py
-final_test.py
-iris.json
+
+# Logs
+*.log
+
+# Snapshots / fixtures legados
 *.html
-/*
 *.json
-!app/
-!app/core/
-!app/core/observability.py
-!.github/
-!.github/workflows/
-!.github/workflows/daily_index.yml
-!scripts/
-!scripts/run_historical_index.py
+!app/**/*.json
 
 # Python-generated files
 __pycache__/
@@ -41,6 +30,4 @@ wheels/
 # Temporary and Data folders
 scratch/
 rag/
-
-# Tests
-tests/
+temp_audios/
