@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     PINECONE_NS_VOCABULARIO: str = "catarata_vocabulario_expandido"
     PINECONE_INDEX_CACHE: Optional[str] = None
     PINECONE_CACHE_NAMESPACE: str = "iris"
+    PINECONE_NS_PRONTUARIOS: str = "prontuarios_pacientes"
+    PRONTUARIO_INDEX_DAYS_BACK: int = 1  # dias retroativos por rodada do cron D-1
 
     # Security
     AGENTE_API_KEY: str

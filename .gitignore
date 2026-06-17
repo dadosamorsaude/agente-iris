@@ -15,6 +15,11 @@ iris.json
 !app/
 !app/core/
 !app/core/observability.py
+!.github/
+!.github/workflows/
+!.github/workflows/daily_index.yml
+!scripts/
+!scripts/run_historical_index.py
 
 # Python-generated files
 __pycache__/

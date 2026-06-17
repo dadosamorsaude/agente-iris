@@ -49,6 +49,7 @@ from app.api.audio import router as audio_router
 from app.api.voice import router as voice_router
 from app.api.ws import router as ws_router
 from app.api.iris_chat import router as iris_router
+from app.api.indexer_router import router as indexer_router
 
 # Parse de domínios permitidos via variável de ambiente (separados por vírgula)
 allowed_origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
@@ -81,6 +82,7 @@ app.include_router(audio_router)
 app.include_router(voice_router)
 app.include_router(ws_router)
 app.include_router(iris_router)
+app.include_router(indexer_router)
 
 
 @app.get("/")

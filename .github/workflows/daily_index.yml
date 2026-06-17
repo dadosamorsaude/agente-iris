@@ -1,0 +1,68 @@
+name: Indexação Diária de Prontuários (D-1)
+
+on:
+  schedule:
+    # Executa todo dia às 05:00 UTC = 02:00 BRT
+    - cron: '0 5 * * *'
+
+  # Permite execução manual pelo painel do GitHub Actions
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Modo de indexação'
+        required: true
+        default: 'd1'
+        type: choice
+        options:
+          - d1
+          - historico
+
+jobs:
+  index-prontuarios:
+    name: Indexar Prontuários no Pinecone
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Indexação D-1 (cron automático)
+        if: github.event_name == 'schedule' || inputs.mode == 'd1'
+        run: |
+          echo "Disparando indexação D-1..."
+          response=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            -X POST "${{ secrets.IRIS_APP_URL }}/internal/index-prontuarios" \
+            -H "X-API-Key: ${{ secrets.AGENTE_API_KEY }}" \
+            -H "Content-Type: application/json")
+
+          echo "HTTP Status: $response"
+          echo "Response:"
+          cat /tmp/response.json | python3 -m json.tool
+
+          if [ "$response" != "200" ]; then
+            echo "❌ Indexação falhou com status $response"
+            exit 1
+          fi
+
+          indexed=$(cat /tmp/response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('indexed',0))")
+          echo "✅ Indexação D-1 concluída: $indexed atendimentos indexados."
+
+      - name: Carga Histórica 90 dias (manual)
+        if: inputs.mode == 'historico'
+        run: |
+          echo "⚠️  Iniciando carga histórica 90 dias (~$26 USD, ~20-30 min)..."
+          response=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            --max-time 3600 \
+            -X POST "${{ secrets.IRIS_APP_URL }}/internal/index-prontuarios/historico" \
+            -H "X-API-Key: ${{ secrets.AGENTE_API_KEY }}" \
+            -H "Content-Type: application/json")
+
+          echo "HTTP Status: $response"
+          echo "Response:"
+          cat /tmp/response.json | python3 -m json.tool
+
+          if [ "$response" != "200" ]; then
+            echo "❌ Carga histórica falhou com status $response"
+            exit 1
+          fi
+
+          indexed=$(cat /tmp/response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('indexed',0))")
+          echo "✅ Carga histórica concluída: $indexed atendimentos indexados."

@@ -23,6 +23,7 @@ from app.services.llm import get_chat_model_openai, get_chat_model_claude
 from app.tools.athena import athena_results_context
 from app.tools.rag import rag_results_context
 from app.agent.tools import tools
+from app.services.prontuario_indexer import index_batch_by_ids
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,13 @@ Quando a tool SQL retornar `grouped_lists: true` e/ou `grouped_rows` populado:
 3. CPF deve ser exibido exatamente como entregue pela tool (completo e formatado sem mascaramento).
 4. Organize a resposta por grupo (uma seção por classificação), com o total do grupo no cabeçalho e a lista de pacientes em seguida.
 5. Se um grupo estiver vazio, declare explicitamente "Nenhum paciente nesta classificação para o período/critério".
+
+## Busca Semântica de Prontuários (processo interno)
+1. Quando a pergunta envolver classificação clínica, identificação de casos ou termos oftalmológicos, derive INTERNAMENTE uma query clínica com base no léxico retornado pelo RAG (ex: 'facectomia indicação catarata LIO bilateral') e invoque `search_similar_records` ANTES de `analyze_and_execute_sql`.
+2. Use os `ids_atendimento` retornados como filtro adicional `WHERE id_atendimento IN (...)` no SQL, ampliando o recall de casos com variações de terminologia.
+3. Este processo é TOTALMENTE INTERNO. Nunca mencione ao usuário que uma busca vetorial foi realizada, nem exponha os IDs retornados ou o score de similaridade.
+4. Fluxo obrigatório quando aplicável: `fetch_clinical_guidelines` → `search_similar_records` → `analyze_and_execute_sql`.
+5. Se `search_similar_records` retornar lista vazia, prossiga normalmente com SQL via regex — a busca semântica é um complemento, não um bloqueio.
 """
 
 def extract_text_from_content(content: Any) -> str:
@@ -254,4 +262,16 @@ async def _post_execution(
     except Exception as e:
         logger.error(f"Erro no post-execution da Iris: {e}")
     finally:
+        # Indexação on-demand: aproveita os IDs já retornados pelo Athena
+        # para vetorizar em background, sem custo adicional de SQL.
+        if raw_athena:
+            ids = [
+                r.get("id_atendimento")
+                for entry in raw_athena
+                for r in (entry.get("results") or [])
+                if r.get("id_atendimento")
+            ]
+            if ids:
+                asyncio.create_task(index_batch_by_ids(ids))
+                logger.info(f"Indexação on-demand agendada para {len(ids)} atendimento(s).")
         flush_langsmith()

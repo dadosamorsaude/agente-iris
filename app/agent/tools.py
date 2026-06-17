@@ -6,6 +6,7 @@ from app.agent.specialists.sql_analyst import sql_analyst_expert
 from app.services.learning import load_curated_lessons
 from app.tools.rag import rag_results_context
 from app.tools.athena import athena_results_context
+from app.tools.prontuario_search import search_similar_records
 
 @tool
 async def fetch_clinical_guidelines(query: str) -> str:
@@ -37,4 +38,4 @@ async def analyze_and_execute_sql(query: str, rag_context: str) -> dict:
     )
     return result
 
-tools = [fetch_clinical_guidelines, fetch_curated_lessons, analyze_and_execute_sql]
+tools = [fetch_clinical_guidelines, fetch_curated_lessons, analyze_and_execute_sql, search_similar_records]
