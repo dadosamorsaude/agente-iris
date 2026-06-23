@@ -172,18 +172,75 @@ async def run_iris_agent(
     rag_used = False
     
     if stream:
-        async for event in react_agent.astream_events({"messages": messages}, version="v2"):
-            if event["event"] == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if isinstance(chunk, AIMessageChunk) and chunk.content:
-                    token = extract_text_from_content(chunk.content)
-                    final_answer += token
-                    yield token
-            elif event["event"] == "on_tool_end":
-                if event["name"] == "analyze_and_execute_sql":
-                    sql_used = True
-                elif event["name"] == "fetch_clinical_guidelines":
-                    rag_used = True
+        TOOL_ALIASES = {
+            "analyze_and_execute_sql": "Análise e Consulta SQL",
+            "fetch_clinical_guidelines": "Busca de Diretrizes (RAG)",
+            "prontuario_search": "Busca de Histórico Médico",
+        }
+
+        event_queue = asyncio.Queue()
+        active_tools = 0
+
+        async def consume_stream():
+            try:
+                async for event in react_agent.astream_events({"messages": messages}, version="v2"):
+                    await event_queue.put(event)
+            except Exception as e:
+                await event_queue.put(e)
+            finally:
+                await event_queue.put(None)
+
+        stream_task = asyncio.create_task(consume_stream())
+
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Envia espaço Keep-Alive para evitar timeout de 100s no Render
+                    yield " "
+                    continue
+
+                if event is None:
+                    break
+                if isinstance(event, Exception):
+                    raise event
+
+                kind = event.get("event")
+
+                if kind == "on_tool_start":
+                    active_tools += 1
+                    tool_name = event.get("name", "ferramenta")
+                    alias = TOOL_ALIASES.get(tool_name, tool_name)
+                    if active_tools == 1:
+                        logger.info(f"Executando ferramenta: {tool_name}")
+                        yield f"\n[⚙️ Pensando: Acionando {alias}...]\n"
+                    continue
+
+                elif kind == "on_tool_end":
+                    active_tools -= 1
+                    tool_name = event.get("name", "ferramenta")
+                    alias = TOOL_ALIASES.get(tool_name, tool_name)
+                    if active_tools == 0:
+                        yield f"\n[✅ {alias} finalizado]\n"
+
+                    if tool_name == "analyze_and_execute_sql":
+                        sql_used = True
+                    elif tool_name == "fetch_clinical_guidelines":
+                        rag_used = True
+                    continue
+
+                elif kind == "on_chat_model_stream":
+                    if active_tools == 0:
+                        chunk = event["data"]["chunk"]
+                        if isinstance(chunk, AIMessageChunk) and chunk.content:
+                            token = extract_text_from_content(chunk.content)
+                            final_answer += token
+                            yield token
+
+        except asyncio.CancelledError:
+            logger.warning("Streaming cancelado pelo cliente.")
+            return
     else:
         response = await react_agent.ainvoke({"messages": messages})
         last_message = response["messages"][-1]
