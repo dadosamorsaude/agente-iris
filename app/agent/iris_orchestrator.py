@@ -158,7 +158,11 @@ async def run_iris_agent(
         f"{IRIS_SYSTEM_PROMPT}"
     )
 
-    llm = get_chat_model_claude()
+    from app.services.llm import get_chat_model_openai
+
+    primary_llm = get_chat_model_claude()
+    fallback_llm = get_chat_model_openai()
+    llm = primary_llm.with_fallbacks([fallback_llm])
     react_agent = create_react_agent(llm, tools=tools, prompt=runtime_prompt)
 
     messages = history_messages + [HumanMessage(content=message)]

@@ -33,7 +33,7 @@ def _build_claude(model: str, temperature: float) -> ChatAnthropic:
         temperature=temperature,
         api_key=settings.ANTHROPIC_API_KEY,
         timeout=settings.HTTP_TIMEOUT,
-        max_retries=settings.HTTP_MAX_RETRIES,
+        max_retries=6,
         callbacks=get_langsmith_callbacks(),
     )
 
