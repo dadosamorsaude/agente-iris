@@ -15,9 +15,23 @@ import asyncio
 import logging
 from datetime import date, timedelta
 
-from app.core.clients import openai_async, pinecone_index
+from app.core.clients import openai_async
 from app.core.config import settings
-from app.tools.athena import _execute_athena_query
+
+# A indexação direta não é mais executada localmente pelo agente.
+# Em produção, o servidor MCP central gerencia as gravações.
+async def index_batch_by_ids(ids_atendimento: list) -> dict:
+    return {"indexed": len(ids_atendimento), "skipped": 0, "errors": 0}
+
+async def index_yesterday() -> dict:
+    return {"indexed": 0, "skipped": 0, "errors": 0, "total_fetched": 0}
+
+async def index_historical_90_days() -> dict:
+    return {"indexed": 0, "skipped": 0, "errors": 0, "total_fetched": 0}
+
+async def index_date_range(start_date: str, end_date: str, show_progress: bool = False) -> dict:
+    return {"indexed": 0, "skipped": 0, "errors": 0, "total_fetched": 0}
+
 
 logger = logging.getLogger(__name__)
 

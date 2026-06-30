@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     DATABASE_URL: Optional[str] = None
     DATABASE_API_KEY: Optional[str] = None
 
+    # Central MCP Server Settings
+    CENTRAL_MCP_URL: str = "https://agentes-mcp-server.onrender.com/sse"
+    AGENT_ID: str = "agent-id-iris-uuid-placeholder"
+    MCP_API_KEY: str = "mcp_sk_central_sec_placeholder_key"
+
     # HTTP / Resiliência (timeouts compartilhados por todos os clientes externos)
     HTTP_TIMEOUT: float = 30.0
     HTTP_MAX_RETRIES: int = 2

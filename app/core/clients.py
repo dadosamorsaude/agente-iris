@@ -32,8 +32,6 @@ from typing import Optional
 import httpx
 from openai import AsyncOpenAI
 from langchain_openai import OpenAIEmbeddings
-from pinecone import Pinecone
-
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -79,27 +77,6 @@ def embeddings_3_small_1024() -> OpenAIEmbeddings:
         timeout=settings.HTTP_TIMEOUT,
         max_retries=settings.HTTP_MAX_RETRIES,
     )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Pinecone
-# ──────────────────────────────────────────────────────────────────────────────
-
-@lru_cache(maxsize=1)
-def pinecone() -> Optional[Pinecone]:
-    """Cliente Pinecone (None se PINECONE_API_KEY não estiver configurada)."""
-    if not settings.PINECONE_API_KEY:
-        return None
-    return Pinecone(api_key=settings.PINECONE_API_KEY)
-
-
-@lru_cache(maxsize=4)
-def pinecone_index(name: str):
-    """Retorna o handler do índice Pinecone, cacheado por nome."""
-    pc = pinecone()
-    if pc is None:
-        raise RuntimeError("PINECONE_API_KEY não configurada.")
-    return pc.Index(name)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

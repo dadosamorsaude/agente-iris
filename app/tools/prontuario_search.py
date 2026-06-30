@@ -17,22 +17,12 @@ import logging
 
 from langchain_core.tools import tool
 
-from app.core.clients import embeddings_3_large, pinecone_index
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-def _search_pinecone(query_vector: list[float], top_k: int) -> list:
-    """Executa busca vetorial síncrona no Pinecone (chamada via asyncio.to_thread)."""
-    index = pinecone_index(settings.PINECONE_RAG_INDEX)
-    result = index.query(
-        vector=query_vector,
-        top_k=top_k,
-        include_metadata=True,
-        namespace=settings.PINECONE_NS_PRONTUARIOS,
-    )
-    return result.matches
+# Busca semântica delegada via MCP server
 
 
 @tool
@@ -51,72 +41,41 @@ async def search_similar_records(query: str, top_k: int = 20) -> str:
     para usar como filtro adicional WHERE em analyze_and_execute_sql,
     aumentando a cobertura de casos que o regex do SQL poderia perder.
     """
-    if not settings.PINECONE_API_KEY:
-        logger.warning("search_similar_records: Pinecone não configurado, retornando vazio.")
-        return json.dumps({
-            "ids_atendimento": [],
-            "total_encontrados": 0,
-            "sugestao_sql_filter": "",
-            "mensagem": "Busca semântica indisponível (Pinecone não configurado).",
-        })
+    logger.info(f"Ferramenta Prontuario Search executando via MCP (async): {query}")
 
     try:
-        query_vector = await embeddings_3_large().aembed_query(query)
-        matches = await asyncio.to_thread(_search_pinecone, query_vector, top_k)
-
-        if not matches:
-            return json.dumps({
-                "ids_atendimento": [],
-                "total_encontrados": 0,
-                "sugestao_sql_filter": "",
-                "mensagem": (
-                    "Nenhum prontuário similar encontrado no índice semântico. "
-                    "Prossiga com a busca SQL usando regex normalmente."
-                ),
-            })
-
-        ids = []
-        trechos = []
-        for match in matches:
-            meta = match.metadata or {}
-            id_atend = meta.get("id_atendimento")
-            if not id_atend:
-                continue
-            ids.append(id_atend)
-            trechos.append({
-                "id_atendimento": id_atend,
-                "score_similaridade": round(float(match.score), 4),
-                "clinica": meta.get("clinica", ""),
-                "regional": meta.get("regional", ""),
-                "data_atendimento": meta.get("data_atendimento", ""),
-                "trecho": meta.get("text", "")[:300],
-            })
-
-        sql_filter = f"id_atendimento IN ({', '.join(ids)})" if ids else ""
-
-        result = {
-            "ids_atendimento": ids,
-            "total_encontrados": len(ids),
-            "sugestao_sql_filter": sql_filter,
-            "instrucao": (
-                "Use 'sugestao_sql_filter' como filtro adicional no SQL para "
-                "ampliar o recall de casos clínicos com variações de terminologia. "
-                "Combine com os filtros de data e clínica já extraídos da pergunta."
-            ),
-            "trechos": trechos,
-        }
-
-        logger.info(
-            f"search_similar_records: {len(ids)} prontuários encontrados "
-            f"| query='{query[:60]}'"
+        from app.services.mcp_client import invoke_mcp_tool
+        response_obj = await invoke_mcp_tool(
+            "search_similar_records_tool",
+            {"query": query, "agent_id": settings.AGENT_ID, "top_k": top_k}
         )
-        return json.dumps(result, ensure_ascii=False)
+
+        # Processamento robusto do retorno do MCP
+        raw_text = ""
+        if isinstance(response_obj, list):
+            parts = []
+            for item in response_obj:
+                if hasattr(item, "text"):
+                    parts.append(item.text)
+                elif isinstance(item, dict) and "text" in item:
+                    parts.append(item["text"])
+                elif isinstance(item, str):
+                    parts.append(item)
+                else:
+                    parts.append(str(item))
+            raw_text = "".join(parts)
+        elif isinstance(response_obj, str):
+            raw_text = response_obj
+        else:
+            raw_text = str(response_obj)
+
+        return raw_text
 
     except Exception as e:
-        logger.error(f"Erro em search_similar_records: {e}")
+        logger.error(f"Erro em search_similar_records via MCP: {e}")
         return json.dumps({
             "ids_atendimento": [],
             "total_encontrados": 0,
             "sugestao_sql_filter": "",
-            "mensagem": f"Erro na busca semântica: {str(e)}. Prossiga com SQL normalmente.",
+            "mensagem": f"Erro na busca semântica via MCP: {str(e)}. Prossiga com SQL normalmente.",
         })

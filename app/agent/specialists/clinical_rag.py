@@ -2,7 +2,7 @@ import json
 import logging
 
 from app.core.observability import get_langsmith_callbacks, traceable
-from app.tools.rag import get_retriever, rag_results_context, format_docs
+from app.tools.rag import rag_results_context, format_docs
 from app.services.llm import get_chat_model_openai
 from app.core.config import settings
 
@@ -11,47 +11,68 @@ logger = logging.getLogger(__name__)
 
 @traceable(name="clinical_rag_expert", as_type="chain")
 async def clinical_rag_expert(query: str) -> str:
-    logger.info(f"Clinical RAG Expert consultando RAG Catarata para query: '{query}'")
+    logger.info(f"Clinical RAG Expert consultando RAG Catarata via MCP para query: '{query}'")
 
-    retriever_treinamento = get_retriever(
-        settings.PINECONE_RAG_INDEX, settings.PINECONE_NS_TREINAMENTO, k=4
-    )
-    retriever_vocabulario = get_retriever(
-        settings.PINECONE_RAG_INDEX, settings.PINECONE_NS_VOCABULARIO, k=4
-    )
+    try:
+        from app.services.mcp_client import invoke_mcp_tool
 
-    if not retriever_treinamento or not retriever_vocabulario:
-        logger.warning("Pinecone não configurado. RAG Expert indisponível.")
-        return "Nenhuma diretriz de catarata disponível no momento."
-
-    docs_treinamento = await retriever_treinamento.ainvoke(query)
-    docs_vocabulario = await retriever_vocabulario.ainvoke(query)
-
-    captured = rag_results_context.get([])
-    rag_results_context.set(
-        captured + [
+        # 1. Busca Treinamento Catarata no MCP
+        response_treinamento = await invoke_mcp_tool(
+            "search_rag_tool",
             {
-                "source": "Treinamento IA Catarata",
-                "namespace": "treinamento_ia_catarata",
                 "query": query,
-                "chunks": [d.page_content for d in docs_treinamento],
-                "metadata": [d.metadata for d in docs_treinamento],
-            },
-            {
-                "source": "Vocabulário Expandido Catarata",
-                "namespace": "catarata_vocabulario_expandido",
-                "query": query,
-                "chunks": [d.page_content for d in docs_vocabulario],
-                "metadata": [d.metadata for d in docs_vocabulario],
+                "agent_id": settings.AGENT_ID,
+                "namespace_key": "catarata",
+                "k": 4
             }
-        ]
-    )
+        )
+        formatted_treinamento = ""
+        if isinstance(response_treinamento, list):
+            formatted_treinamento = "".join(item.text if hasattr(item, "text") else str(item) for item in response_treinamento)
+        elif isinstance(response_treinamento, str):
+            formatted_treinamento = response_treinamento
 
-    if not docs_treinamento and not docs_vocabulario:
+        # 2. Busca Vocabulário Catarata no MCP
+        response_vocabulario = await invoke_mcp_tool(
+            "search_rag_tool",
+            {
+                "query": query,
+                "agent_id": settings.AGENT_ID,
+                "namespace_key": "vocabulario",
+                "k": 4
+            }
+        )
+        formatted_vocabulario = ""
+        if isinstance(response_vocabulario, list):
+            formatted_vocabulario = "".join(item.text if hasattr(item, "text") else str(item) for item in response_vocabulario)
+        elif isinstance(response_vocabulario, str):
+            formatted_vocabulario = response_vocabulario
+
+        # Registra dados no contexto para uso do avaliador
+        captured = rag_results_context.get([])
+        rag_results_context.set(
+            captured + [
+                {
+                    "source": "Treinamento IA Catarata (MCP)",
+                    "namespace": "treinamento_ia_catarata",
+                    "query": query,
+                    "results": formatted_treinamento,
+                },
+                {
+                    "source": "Vocabulário Expandido Catarata (MCP)",
+                    "namespace": "catarata_vocabulario_expandido",
+                    "query": query,
+                    "results": formatted_vocabulario,
+                }
+            ]
+        )
+
+    except Exception as e:
+        logger.error(f"Erro ao consultar RAG via MCP no RAG Expert: {e}")
+        return "Nenhuma diretriz clínica disponível no momento devido a erro técnico."
+
+    if not formatted_treinamento.strip() and not formatted_vocabulario.strip():
         return "Nenhuma diretriz clínica específica encontrada para esta consulta de cirurgia de catarata."
-
-    formatted_treinamento = format_docs(docs_treinamento)
-    formatted_vocabulario = format_docs(docs_vocabulario)
 
     llm = get_chat_model_openai(temperature=0.0, model=settings.MODEL_NAME_SQL)
 
