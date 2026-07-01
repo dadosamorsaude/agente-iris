@@ -9,8 +9,7 @@ from app.agent.iris_orchestrator import run_iris_agent
 from app.api.security import get_api_key
 from app.core.logger import logger
 from app.services.cache import semantic_cache
-from app.tools.athena import athena_results_context
-from app.tools.rag import rag_results_context
+from app.services.mcp_client import athena_results_context, rag_results_context
 
 router = APIRouter(prefix="/api/v1/iris", tags=["Iris Agent"])
 

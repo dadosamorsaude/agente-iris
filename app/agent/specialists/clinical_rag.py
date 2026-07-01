@@ -2,7 +2,7 @@ import json
 import logging
 
 from app.core.observability import get_langsmith_callbacks, traceable
-from app.tools.rag import rag_results_context, format_docs
+from app.services.mcp_client import rag_results_context
 from app.services.llm import get_chat_model_openai
 from app.core.config import settings
 
