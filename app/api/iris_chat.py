@@ -379,8 +379,10 @@ async def clinics_endpoint(
     sql = "SELECT DISTINCT clinica FROM pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia WHERE clinica IS NOT NULL AND clinica <> ''"
     
     try:
-        from app.tools.athena import _execute_traced
-        results = await asyncio.to_thread(_execute_traced, sql)
+        from app.services.mcp_client import query_athena_tool
+        import json
+        results_str = await query_athena_tool._arun(sql)
+        results = json.loads(results_str)
         
         raw_clinics = [row["clinica"] for row in results if "clinica" in row and row["clinica"]]
         
