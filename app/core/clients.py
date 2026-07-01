@@ -31,10 +31,33 @@ from typing import Optional
 
 import httpx
 from openai import AsyncOpenAI
+from pinecone import Pinecone
 from langchain_openai import OpenAIEmbeddings
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pinecone
+# ──────────────────────────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def pinecone() -> Optional[Pinecone]:
+    """Cliente Pinecone compartilhado, lazy."""
+    if not settings.PINECONE_API_KEY:
+        logger.warning("PINECONE_API_KEY não configurada.")
+        return None
+    return Pinecone(api_key=settings.PINECONE_API_KEY)
+
+
+@lru_cache(maxsize=16)
+def pinecone_index(index_name: str):
+    """Retorna o index Pinecone correspondente."""
+    pc = pinecone()
+    if pc is None:
+        raise RuntimeError("Pinecone não configurado. Verifique PINECONE_API_KEY.")
+    return pc.Index(index_name)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

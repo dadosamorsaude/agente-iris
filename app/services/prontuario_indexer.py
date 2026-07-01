@@ -15,7 +15,7 @@ import asyncio
 import logging
 from datetime import date, timedelta
 
-from app.core.clients import openai_async
+from app.core.clients import openai_async, pinecone_index
 from app.core.config import settings
 
 # A indexação direta não é mais executada localmente pelo agente.
