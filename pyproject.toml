@@ -38,3 +38,6 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+norecursedirs = ["scratch", ".venv"]
+addopts = "--ignore=scratch"
+pythonpath = ["."]

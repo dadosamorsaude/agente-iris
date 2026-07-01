@@ -41,17 +41,45 @@ def _tool(fn=None, *args, **kwargs):
     return wrap
 
 
-sys.modules.setdefault("langchain_core", types.ModuleType("langchain_core"))
-_mk("langchain_core.tools", tool=_tool)
-_mk("langchain_core.messages", HumanMessage=object, SystemMessage=object,
-    AIMessageChunk=object, AIMessage=object, BaseMessage=object)
-_mk("pyathena", connect=lambda **k: None)
-_mk("langchain_openai", ChatOpenAI=object, OpenAIEmbeddings=object)
-_mk("langchain_anthropic", ChatAnthropic=object)
-_mk("pinecone", Pinecone=object)
-_mk("langchain_pinecone", PineconeVectorStore=object)
-sys.modules.setdefault("langgraph", types.ModuleType("langgraph"))
-_mk("langgraph.prebuilt", create_react_agent=lambda *a, **k: None)
+# --- external libs mock only if not installed ---
+try:
+    import langchain_core
+except ImportError:
+    sys.modules.setdefault("langchain_core", types.ModuleType("langchain_core"))
+    _mk("langchain_core.tools", tool=_tool, BaseTool=object)
+    _mk("langchain_core.messages", HumanMessage=object, SystemMessage=object,
+        AIMessageChunk=object, AIMessage=object, BaseMessage=object)
+
+try:
+    import pyathena
+except ImportError:
+    _mk("pyathena", connect=lambda **k: None)
+
+try:
+    import langchain_openai
+except ImportError:
+    _mk("langchain_openai", ChatOpenAI=object, OpenAIEmbeddings=object)
+
+try:
+    import langchain_anthropic
+except ImportError:
+    _mk("langchain_anthropic", ChatAnthropic=object)
+
+try:
+    import pinecone
+except ImportError:
+    _mk("pinecone", Pinecone=object)
+
+try:
+    import langchain_pinecone
+except ImportError:
+    _mk("langchain_pinecone", PineconeVectorStore=object)
+
+try:
+    import langgraph
+except ImportError:
+    sys.modules.setdefault("langgraph", types.ModuleType("langgraph"))
+    _mk("langgraph.prebuilt", create_react_agent=lambda *a, **k: None)
 
 if "langsmith" not in sys.modules:
     def _traceable(*a, **k):

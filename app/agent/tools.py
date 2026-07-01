@@ -4,8 +4,7 @@ from langchain_core.tools import tool
 from app.agent.specialists.clinical_rag import clinical_rag_expert
 from app.agent.specialists.sql_analyst import sql_analyst_expert
 from app.services.learning import load_curated_lessons
-from app.tools.rag import rag_results_context
-from app.tools.athena import athena_results_context
+from app.services.mcp_client import rag_results_context, athena_results_context
 from app.tools.prontuario_search import search_similar_records
 
 @tool

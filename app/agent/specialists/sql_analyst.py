@@ -43,7 +43,7 @@ def _is_transient_athena_error(msg: str) -> bool:
 
 from app.core.observability import get_langsmith_callbacks, traceable
 from app.services.intent import normalize_text, detect_grouped_lists
-from app.tools.athena import query_athena_tool, validate_sql, athena_results_context
+from app.services.mcp_client import query_athena_tool, athena_results_context
 from app.services.llm import get_chat_model_openai
 from app.core.config import settings
 
