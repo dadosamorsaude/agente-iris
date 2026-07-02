@@ -16,8 +16,8 @@ async def clinical_rag_expert(query: str) -> str:
     try:
         from app.services.mcp_client import invoke_mcp_tool
 
-        # 1. Busca Treinamento Catarata no MCP
-        response_treinamento = await invoke_mcp_tool(
+        # 1. Busca Treinamento e Vocabulário Catarata no MCP concorrentemente
+        task_treinamento = invoke_mcp_tool(
             "search_rag_tool",
             {
                 "query": query,
@@ -26,14 +26,7 @@ async def clinical_rag_expert(query: str) -> str:
                 "k": 4
             }
         )
-        formatted_treinamento = ""
-        if isinstance(response_treinamento, list):
-            formatted_treinamento = "".join(item.text if hasattr(item, "text") else str(item) for item in response_treinamento)
-        elif isinstance(response_treinamento, str):
-            formatted_treinamento = response_treinamento
-
-        # 2. Busca Vocabulário Catarata no MCP
-        response_vocabulario = await invoke_mcp_tool(
+        task_vocabulario = invoke_mcp_tool(
             "search_rag_tool",
             {
                 "query": query,
@@ -42,6 +35,17 @@ async def clinical_rag_expert(query: str) -> str:
                 "k": 4
             }
         )
+        
+        response_treinamento, response_vocabulario = await asyncio.gather(
+            task_treinamento, task_vocabulario
+        )
+        
+        formatted_treinamento = ""
+        if isinstance(response_treinamento, list):
+            formatted_treinamento = "".join(item.text if hasattr(item, "text") else str(item) for item in response_treinamento)
+        elif isinstance(response_treinamento, str):
+            formatted_treinamento = response_treinamento
+
         formatted_vocabulario = ""
         if isinstance(response_vocabulario, list):
             formatted_vocabulario = "".join(item.text if hasattr(item, "text") else str(item) for item in response_vocabulario)
