@@ -222,20 +222,26 @@ class MCPRAGTool(BaseTool):
         raise NotImplementedError("Use async execution")
 
     async def _arun(self, query: str) -> str:
+        import asyncio
         results_text = []
         captured_chunks = []
         
-        for namespace in self.namespace_keys:
+        async def fetch_namespace(ns):
             response = await invoke_mcp_tool(
                 "search_rag_tool",
                 {
                     "query": query,
                     "agent_id": settings.AGENT_ID,
-                    "namespace_key": namespace,
+                    "namespace_key": ns,
                     "k": 4
                 }
             )
-            
+            return ns, response
+
+        tasks = [fetch_namespace(ns) for ns in self.namespace_keys]
+        task_results = await asyncio.gather(*tasks)
+        
+        for namespace, response in task_results:
             raw_text = ""
             if isinstance(response, list):
                 parts = []
