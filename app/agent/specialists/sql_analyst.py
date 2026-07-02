@@ -49,6 +49,19 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def validate_sql(sql: str) -> None:
+    """Validates SQL to allow only read-only SELECT queries."""
+    sql_upper = sql.upper()
+    forbidden = ["INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ", "TRUNCATE "]
+    if any(token in sql_upper for token in forbidden):
+        logger.error(f"Operacao proibida detectada no SQL: {sql}")
+        raise ValueError("SQL contem operacao proibida. Apenas SELECT e permitido.")
+
+    if "SELECT *" in sql_upper:
+        raise ValueError("SELECT * nao e permitido. Por favor, liste as colunas explicitamente.")
+
+
 # Schema oficial da tabela de catarata do N8N
 CATARATA_SCHEMA = """
 Tabela principal: pdgt_amorsaude_tecnologia.fl_prontuarios_oftalmologia (alias: fp)
