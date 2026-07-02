@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from typing import Any, AsyncGenerator
-from app.services.validator import validate_response
 
 logger = logging.getLogger(__name__)
 
