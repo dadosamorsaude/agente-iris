@@ -104,6 +104,13 @@ async def run_iris_agent(
         yield "Por favor, digite uma mensagem."
         return
 
+    # Guardrail de Entrada (Estratégia A) contra Prompt Injection
+    from app.services.guardrails import is_message_safe
+    is_safe, error_msg = await is_message_safe(message)
+    if not is_safe:
+        yield error_msg
+        return
+
     job_id = str(uuid.uuid4())
     hoje = date.today().isoformat()
     effective_session = session_id or user_id
