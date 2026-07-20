@@ -31,7 +31,6 @@ SQL_RETRY_MAX_SLEEP = 8.0   # teto do backoff
 # Erros lógicos do Athena que NÃO valem retry com repair (são 4xx do nosso lado).
 # Devemos abortar imediatamente sem gastar tokens de LLM tentando consertar.
 _PERMANENT_ATHENA_ERRORS = (
-    "InvalidRequestException",
     "AccessDeniedException",
     "ResourceNotFoundException",
 )

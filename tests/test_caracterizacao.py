@@ -7,6 +7,7 @@ from app.agent.specialists.sql_analyst import (
     _compact_detail_row,
     _group_rows_by_classification,
     extract_laterality,
+    _is_transient_athena_error,
 )
 from app.services.intent import detect_grouped_lists, detect_intent
 
@@ -47,6 +48,14 @@ def test_classify_group_canonical():
 def test_classify_group_empty():
     assert _classify_group(None) is None
     assert _classify_group("") is None
+
+
+# _is_transient_athena_error
+def test_is_transient_athena_error():
+    assert _is_transient_athena_error("An error occurred (InvalidRequestException) when calling the StartQueryExecution operation") is True
+    assert _is_transient_athena_error("An error occurred (AccessDeniedException)") is False
+    assert _is_transient_athena_error("An error occurred (ResourceNotFoundException)") is False
+    assert _is_transient_athena_error("Some random network timeout or connection lost") is True
 
 
 # detect_grouped_lists / detect_intent
