@@ -214,7 +214,10 @@ async def report_endpoint(
         period_text = "de todo o historico sem filtro de periodo"
 
     # 3. Constrói a query para o SQL analyst
-    query_text = f"caracterizacao dos pacientes por classificacao clinica {period_text}"
+    if clinic:
+        query_text = f"caracterizacao dos pacientes por classificacao clinica {period_text} na clinica '{clinic}'"
+    else:
+        query_text = f"caracterizacao dos pacientes por classificacao clinica {period_text}"
 
     try:
         # 4. Obtém o contexto clínico (RAG)
@@ -283,7 +286,28 @@ async def report_endpoint(
                 "percentual_pos_operatorios": round(pos_op / total * 100, 2) if total > 0 else 0
             }
 
-        overall_summary = compute_summary_stats(all_rows)
+        def compute_summary_from_counts(counts: dict) -> dict:
+            total = counts.get("total_registros") or 0
+            pacientes_unicos = counts.get("total_pacientes_unicos") or 0
+            positivos = counts.get("positivos") or 0
+            provaveis = counts.get("provaveis") or 0
+            negativos = counts.get("negativos") or 0
+            pos_op = counts.get("pos_operatorios") or 0
+            
+            return {
+                "total_registros": total,
+                "total_pacientes_unicos": pacientes_unicos,
+                "positivos": positivos,
+                "provaveis": provaveis,
+                "negativos": negativos,
+                "pos_operatorios": pos_op,
+                "percentual_positivos": round(positivos / total * 100, 2) if total > 0 else 0,
+                "percentual_provaveis": round(provaveis / total * 100, 2) if total > 0 else 0,
+                "percentual_negativos": round(negativos / total * 100, 2) if total > 0 else 0,
+                "percentual_pos_operatorios": round(pos_op / total * 100, 2) if total > 0 else 0
+            }
+
+        overall_summary = compute_summary_from_counts(result.get("summary", {}))
 
         # 7. Aplica os filtros in-memory
         filtered_rows = all_rows

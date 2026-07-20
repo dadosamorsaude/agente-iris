@@ -968,8 +968,69 @@ def _format_sql_result(
         }
 
     if grouped_lists:
-        max_rows = 0  # caracterizacao nunca trunca
-    elif query_shape == "aggregate" and output_mode == "summary":
+        # Caracterizacao: compactamos cada linha (mascara CPF, normaliza campos) e
+        # agrupamos por classificacao. raw_rows preserva o registro original para auditoria,
+        # mas o orquestrador deve usar grouped_rows.
+        total_reg = len(results)
+        pacientes_unicos = len({
+            r.get("id_paciente") for r in results if r.get("id_paciente") is not None
+        }) or None
+
+        positivos_count = 0
+        provaveis_count = 0
+        negativos_count = 0
+        pos_operatorios_count = 0
+        for r in results:
+            grp = _classify_group(
+                r.get("classificacao")
+                or r.get("estrato")
+                or r.get("classe")
+            )
+            if grp == "positivos":
+                positivos_count += 1
+            elif grp == "provaveis":
+                provaveis_count += 1
+            elif grp == "negativos":
+                negativos_count += 1
+            elif grp == "pos_operatorios":
+                pos_operatorios_count += 1
+
+        max_rows = 2000
+        rows_to_return = results[:max_rows]
+        truncated = len(results) > max_rows
+
+        compact_rows = [_compact_detail_row(row) for row in rows_to_return]
+        grouped = _group_rows_by_classification(compact_rows)
+        safe_raw = [_make_json_safe(row) for row in rows_to_return]
+        
+        # Remove cpf cru de raw_rows para nao vazar CPF nao mascarado no log/judge.
+        for r in safe_raw:
+            if isinstance(r, dict) and "cpf_paciente" in r:
+                r["cpf_paciente"] = _mask_cpf(r.get("cpf_paciente"))
+                
+        payload = {
+            "execution_status": "success",
+            "summary": {
+                "total_registros": total_reg,
+                "total_pacientes_unicos": pacientes_unicos,
+                "positivos": positivos_count,
+                "provaveis": provaveis_count,
+                "negativos": negativos_count,
+                "pos_operatorios": pos_operatorios_count,
+            },
+            "rows": compact_rows,
+            "raw_rows": safe_raw,
+            "grouped_rows": grouped,
+            "group_counts": {k: len(v) for k, v in grouped.items()},
+            "row_count": len(compact_rows),
+            "total_rows_returned_by_athena": total_reg,
+            "truncated": truncated,
+            "error": None,
+            "limitations": ["Resultados detalhados truncados para evitar estouro de memória."] if truncated else [],
+        }
+        return payload
+
+    if query_shape == "aggregate" and output_mode == "summary":
         max_rows = 0
     else:
         max_rows = detail_limit if detail_limit > 0 else 0
@@ -980,42 +1041,6 @@ def _format_sql_result(
         rows_to_return = results
 
     truncated = len(results) > len(rows_to_return)
-
-    if grouped_lists:
-        # Caracterizacao: compactamos cada linha (mascara CPF, normaliza campos) e
-        # agrupamos por classificacao. raw_rows preserva o registro original para auditoria,
-        # mas o orquestrador deve usar grouped_rows.
-        compact_rows = [_compact_detail_row(row) for row in rows_to_return]
-        grouped = _group_rows_by_classification(compact_rows)
-        safe_raw = [_make_json_safe(row) for row in rows_to_return]
-        # Remove cpf cru de raw_rows para nao vazar CPF nao mascarado no log/judge.
-        for r in safe_raw:
-            if isinstance(r, dict) and "cpf_paciente" in r:
-                r["cpf_paciente"] = _mask_cpf(r.get("cpf_paciente"))
-        payload = {
-            "execution_status": "success",
-            "summary": {},
-            "rows": compact_rows,
-            "raw_rows": safe_raw,
-            "grouped_rows": grouped,
-            "group_counts": {k: len(v) for k, v in grouped.items()},
-            "row_count": len(compact_rows),
-            "total_rows_returned_by_athena": len(results),
-            "truncated": False,
-            "error": None,
-            "limitations": [],
-        }
-        payload["summary"] = {
-            "total_registros": len(results),
-            "total_pacientes_unicos": len({
-                r.get("id_paciente") for r in results if r.get("id_paciente") is not None
-            }) or None,
-            "positivos": len(grouped.get("positivos", [])),
-            "provaveis": len(grouped.get("provaveis", [])),
-            "negativos": len(grouped.get("negativos", [])),
-            "pos_operatorios": len(grouped.get("pos_operatorios", [])),
-        }
-        return payload
 
     safe_rows = [_make_json_safe(row) for row in rows_to_return]
     # Mesmo fora de caracterizacao, se cpf_paciente aparecer (algum outro modo
